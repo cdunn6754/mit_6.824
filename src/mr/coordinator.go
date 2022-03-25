@@ -1,15 +1,18 @@
 package mr
 
-import "log"
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
-
+import (
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"sync"
+)
 
 type Coordinator struct {
 	// Your definitions here.
-
+	mu sync.Mutex
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -24,6 +27,10 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	return nil
 }
 
+func (c *Coordinator) GetMapTask(args *GetMapArgs, reply *GetMapReply) error {
+	reply.FileName = "hiya buddy"
+	return nil
+}
 
 //
 // start a thread that listens for RPCs from worker.go
@@ -31,7 +38,6 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 func (c *Coordinator) server() {
 	rpc.Register(c)
 	rpc.HandleHTTP()
-	//l, e := net.Listen("tcp", ":1234")
 	sockname := coordinatorSock()
 	os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
@@ -50,7 +56,6 @@ func (c *Coordinator) Done() bool {
 
 	// Your code here.
 
-
 	return ret
 }
 
@@ -62,8 +67,11 @@ func (c *Coordinator) Done() bool {
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 
-	// Your code here.
+	fmt.Print("All fileNames:\n")
+	for _, fileName := range files {
 
+		fmt.Print(fileName, "\n")
+	}
 
 	c.server()
 	return &c
