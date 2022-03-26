@@ -1,10 +1,14 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io/ioutil"
 	"log"
 	"net/rpc"
+	"os"
+	"sort"
 )
 
 //
@@ -24,22 +28,57 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+func getJobNum(key string, nReduce int) int {
+	return ihash(key) % nReduce
+}
+
 //
 // main/mrworker.go calls this function.
 //
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	fileName := getMapTask()
-	fmt.Printf("reply.fileName: %v\n", fileName)
+	reply := getMapTask()
+	fileName := reply.FileName
+	file, err := os.Open(fileName)
+	if err != nil {
+		log.Fatalf("cannot open %v", fileName)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("problem reading %v", fileName)
+	}
+	file.Close()
+	mapped := mapf(fileName, string(content))
+	// Collect all of the kvs by which reduce job they will have
+	var reduceMap = make(map[int][]KeyValue)
+	for _, kv := range mapped {
+		reduceNum := getJobNum(kv.Key, reply.NReduce)
+		if len(reduceMap[reduceNum]) == 0 {
+			reduceMap[reduceNum] = make([]KeyValue, 0)
+		}
+		reduceMap[reduceNum] = append(reduceMap[reduceNum], kv)
+	}
+	// Sort all of the slices before writing to a file
+	for reduceNum, kvs := range reduceMap {
+		sort.Slice(kvs, func(i, j int) bool {
+			return kvs[i].Key < kvs[j].Key
+		})
+		oname := fmt.Sprintf("map_out_%d_%d", reply.TaskNum, reduceNum)
+		ofile, _ := os.Create(oname)
+		enc := json.NewEncoder(ofile)
+		enc.Encode(&kvs)
+	}
+
+	fmt.Printf("Finished processing: %v\n", fileName)
 }
 
 // RPC call
-func getMapTask() string {
+func getMapTask() GetMapReply {
 	args := GetMapArgs{}
 	reply := GetMapReply{}
 	call("Coordinator.GetMapTask", &args, &reply)
-	return reply.FileName
+	return reply
 }
 
 //

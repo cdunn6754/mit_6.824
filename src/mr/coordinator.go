@@ -14,17 +14,22 @@ type Coordinator struct {
 	// Your definitions here.
 	fileNames []string
 	fMu       sync.Mutex
+	nReduce   int
+	mTaskNum  int
 }
 
 // RPC
 func (c *Coordinator) GetMapTask(args *GetMapArgs, reply *GetMapReply) error {
 	c.fMu.Lock()
 	defer c.fMu.Unlock()
+	reply.TaskNum = c.mTaskNum
 	if len(c.fileNames) > 0 {
 		reply.FileName, c.fileNames = c.fileNames[0], c.fileNames[1:]
+		c.mTaskNum += 1
 	} else {
 		reply.FileName = ""
 	}
+	reply.NReduce = c.nReduce
 	fmt.Printf("Returning: %v\n", reply.FileName)
 	fmt.Printf("Remaining count: %d\n\n", len(c.fileNames))
 	return nil
@@ -66,6 +71,8 @@ func (c *Coordinator) Done() bool {
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
 		fileNames: files,
+		nReduce:   nReduce,
+		mTaskNum:  1,
 	}
 	c.server()
 	return &c

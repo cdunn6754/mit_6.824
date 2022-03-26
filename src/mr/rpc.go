@@ -30,6 +30,8 @@ type GetMapArgs struct{}
 
 type GetMapReply struct {
 	FileName string
+	NReduce  int
+	TaskNum  int
 }
 
 // Cook up a unique-ish UNIX-domain socket name
