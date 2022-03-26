@@ -12,23 +12,21 @@ import (
 
 type Coordinator struct {
 	// Your definitions here.
-	mu sync.Mutex
+	fileNames []string
+	fMu       sync.Mutex
 }
 
-// Your code here -- RPC handlers for the worker to call.
-
-//
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
-	return nil
-}
-
+// RPC
 func (c *Coordinator) GetMapTask(args *GetMapArgs, reply *GetMapReply) error {
-	reply.FileName = "hiya buddy"
+	c.fMu.Lock()
+	defer c.fMu.Unlock()
+	if len(c.fileNames) > 0 {
+		reply.FileName, c.fileNames = c.fileNames[0], c.fileNames[1:]
+	} else {
+		reply.FileName = ""
+	}
+	fmt.Printf("Returning: %v\n", reply.FileName)
+	fmt.Printf("Remaining count: %d\n\n", len(c.fileNames))
 	return nil
 }
 
@@ -52,11 +50,12 @@ func (c *Coordinator) server() {
 // if the entire job has finished.
 //
 func (c *Coordinator) Done() bool {
-	ret := false
-
-	// Your code here.
-
-	return ret
+	c.fMu.Lock()
+	defer c.fMu.Unlock()
+	if len(c.fileNames) == 0 {
+		return true
+	}
+	return false
 }
 
 //
@@ -65,14 +64,9 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{}
-
-	fmt.Print("All fileNames:\n")
-	for _, fileName := range files {
-
-		fmt.Print(fileName, "\n")
+	c := Coordinator{
+		fileNames: files,
 	}
-
 	c.server()
 	return &c
 }
