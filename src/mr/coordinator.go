@@ -52,7 +52,17 @@ func (c *Coordinator) mapTaskTimeout(task *MapTask) {
 	c.fMu.Lock()
 	defer c.fMu.Unlock()
 	if task.State == Pending {
-		fmt.Printf("Task with filename %v timed out.", task.FileName)
+		fmt.Printf("Map task with filename %v timed out and was set to ready.", task.FileName)
+		task.State = Ready
+	}
+}
+
+func (c *Coordinator) reduceTaskTimeout(task *ReduceTask) {
+	time.Sleep(10 * time.Second)
+	c.fMu.Lock()
+	defer c.fMu.Unlock()
+	if task.State == Pending {
+		fmt.Printf("Reduce task number %v timed out and was set to ready.", task.TaskNum)
 		task.State = Ready
 	}
 }
@@ -77,6 +87,17 @@ func (c *Coordinator) mapDone() bool {
 	c.fMu.Lock()
 	defer c.fMu.Unlock()
 	for _, task := range c.mapTasks {
+		if task.State != Complete {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Coordinator) reduceDone() bool {
+	c.fMu.Lock()
+	defer c.fMu.Unlock()
+	for _, task := range c.reduceTasks {
 		if task.State != Complete {
 			return false
 		}
@@ -113,6 +134,21 @@ func (c *Coordinator) claimNextMapTask() (*MapTask, bool) {
 	return &MapTask{}, false
 }
 
+// Try to get the next reduceTask that is available for work
+// If all tasks are already claimed, return false
+func (c *Coordinator) claimNextReduceTask() (*ReduceTask, bool) {
+	c.fMu.Lock()
+	defer c.fMu.Unlock()
+	for idx, rt := range c.reduceTasks {
+		if rt.State == Ready {
+			prt := &c.reduceTasks[idx]
+			prt.State = Pending
+			return prt, true
+		}
+	}
+	return &ReduceTask{}, false
+}
+
 //
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
@@ -147,6 +183,41 @@ func (c *Coordinator) RegisterWorker(args *RegisterWorkerArgs, reply *RegisterWo
 	defer c.fMu.Unlock()
 	c.workers = append(c.workers, WorkerInstance{id: reply.WorkerId})
 	fmt.Printf("Registered worker: %v\n", reply.WorkerId)
+	return nil
+}
+
+// Try to get a task to send to the worker.
+func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
+	// Within a given phase it's possible for all of the task to be claimed before
+	// the phase is complete. I.e. there is none that are ready but at least one that
+	// is pending, represent that state with AllClaimed = true
+	reply.AllClaimed = false
+	// Finished is true when both the map and reduce phases are complete
+	reply.Finished = false
+	// Check which phase we are in, map vs reduce
+	if !c.mapDone() {
+		reply.Type = Map
+		pmt, success := c.claimNextMapTask()
+		if success {
+			reply.MapTask = *pmt
+			go c.mapTaskTimeout(pmt)
+			fmt.Printf("Claimed map task with filename: %v\n", pmt.FileName)
+		} else {
+			reply.AllClaimed = true
+			fmt.Print("All map tasks claimed.\n")
+		}
+	} else if !c.reduceDone() {
+		reply.Type = Reduce
+		prt, success := c.claimNextReduceTask()
+		if success {
+			reply.ReduceTask = *prt
+			go c.reduceTaskTimeout(prt)
+			fmt.Printf("Claimed reduce task number :%v\n", prt.TaskNum)
+		} else {
+			reply.AllClaimed = true
+			fmt.Print("All map tasks claimed.\n")
+		}
+	}
 	return nil
 }
 
@@ -191,7 +262,6 @@ func (c *Coordinator) PushMapDone(args *PushMapDoneArgs, reply *PushMapDoneReply
 				mapfiles := &task.MapFiles
 				*mapfiles = append(*mapfiles, onames...)
 			}
-
 		}
 	}
 	if !found {

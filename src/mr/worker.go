@@ -87,31 +87,28 @@ func processMapTask(mapf func(string, string) []KeyValue, task MapTask, nReduce 
 //
 func handleMapPhase(mapf func(string, string) []KeyValue, workerId int, nReduce int) {
 	for true {
-		reply, success := getMapTask()
+		reply, success := getTask()
 		if !success {
 			// An RPC error occurred
 			log.Fatalf("Failed to get next map task for worker %d", workerId)
 			log.Fatal("Retrying in a second...")
 			time.Sleep(time.Second)
 			continue
-		} else if reply.PhaseComplete {
-			// This indicates that all of the map tasks are complete, time to start reducin'
-			fmt.Println("Mapping phase complete, starting reduce phase")
-			break
 		} else if reply.AllClaimed {
 			// The phase isn't done, but all of the tasks are claimed, presumably another worker is
 			// working on the last one
-			fmt.Println("All mapping tasks are claimed, waiting and retrying.")
+			fmt.Printf("All %v tasks are claimed, waiting and retrying.\n", reply.Type)
 			time.Sleep(time.Second)
 			continue
-		} else {
+		} else if reply.Type == Map {
 			// Actually do a map task
-			onames, success := processMapTask(mapf, reply.Task, nReduce)
+			task := reply.MapTask
+			onames, success := processMapTask(mapf, task, nReduce)
 			if success {
-				pushMapDone(reply.Task.FileName, onames, reply.Task.TaskNum, workerId)
+				pushMapDone(task.FileName, onames, task.TaskNum, workerId)
 				time.Sleep(time.Second)
 			} else {
-				log.Fatalf("Map task %d failed for worker %d", reply.Task.TaskNum, workerId)
+				log.Fatalf("Map task %d failed for worker %d", task.TaskNum, workerId)
 				log.Fatal("Retrying in a second...")
 				time.Sleep(time.Second)
 			}
@@ -141,6 +138,15 @@ func getMapTask() (GetMapReply, bool) {
 	success := call("Coordinator.GetMapTask", &args, &reply)
 	if !success {
 		return GetMapReply{}, false
+	}
+	return reply, true
+}
+
+func getTask() (GetTaskReply, bool) {
+	reply := GetTaskReply{}
+	success := call("Coordinator.GetTask", &GetTaskArgs{}, &reply)
+	if !success {
+		return GetTaskReply{}, false
 	}
 	return reply, true
 }

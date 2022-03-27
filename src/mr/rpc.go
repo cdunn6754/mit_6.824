@@ -16,6 +16,22 @@ type GetMapReply struct {
 	AllClaimed    bool
 }
 
+type tasktype int
+
+const (
+	Map tasktype = iota
+	Reduce
+)
+
+type GetTaskArgs struct{}
+type GetTaskReply struct {
+	Type       tasktype
+	MapTask    MapTask
+	ReduceTask ReduceTask
+	AllClaimed bool
+	Finished   bool
+}
+
 type PushMapDoneArgs struct {
 	FileName string
 	OutNames map[int][]string
