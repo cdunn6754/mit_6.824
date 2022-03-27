@@ -8,24 +8,25 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
+	"time"
 )
 
-type taskStatus int
+type taskstate int
 
 const (
-	Pending taskStatus = iota
+	Pending taskstate = iota
 	Complete
 	Ready
 )
 
 type MapTask struct {
-	State    taskStatus
+	State    taskstate
 	FileName string
 	TaskNum  int
 }
 
 type ReduceTask struct {
-	State    taskStatus
+	State    taskstate
 	OutFile  string
 	MapFiles []string
 	TaskNum  int
@@ -41,6 +42,19 @@ type Coordinator struct {
 	fMu         sync.Mutex
 	nReduce     int
 	workers     []WorkerInstance
+}
+
+//
+// Wait 10 seconds, if the task isn't done yet, assume it failed
+//
+func (c *Coordinator) taskTimeout(state *taskstate) {
+	time.Sleep(10 * time.Second)
+
+	c.fMu.Lock()
+	defer c.fMu.Unlock()
+	if *state != Complete {
+		*state = Ready
+	}
 }
 
 //
@@ -143,6 +157,7 @@ func (c *Coordinator) GetMapTask(args *GetMapArgs, reply *GetMapReply) error {
 	mt, success := c.claimNextMapTask()
 	if success {
 		reply.Task = mt
+		go c.taskTimeout(&mt.State)
 		fmt.Printf("Claimed %v\n", reply.Task.FileName)
 	} else {
 		reply.Task = MapTask{}
@@ -153,8 +168,6 @@ func (c *Coordinator) GetMapTask(args *GetMapArgs, reply *GetMapReply) error {
 	}
 	return nil
 }
-
-// TODO need to status the workers and swap a task back from pending to ready
 
 // Mark a mapping task done, store the name of the map output files
 func (c *Coordinator) PushMapDone(args *PushMapDoneArgs, reply *PushMapDoneReply) error {
