@@ -14,9 +14,9 @@ import (
 type taskstate int
 
 const (
-	Pending taskstate = iota
+	Ready taskstate = iota
 	Complete
-	Ready
+	Pending
 )
 
 type MapTask struct {
@@ -47,13 +47,13 @@ type Coordinator struct {
 //
 // Wait 10 seconds, if the task isn't done yet, assume it failed
 //
-func (c *Coordinator) taskTimeout(state *taskstate) {
+func (c *Coordinator) mapTaskTimeout(task *MapTask) {
 	time.Sleep(10 * time.Second)
-
 	c.fMu.Lock()
 	defer c.fMu.Unlock()
-	if *state != Complete {
-		*state = Ready
+	if task.State == Pending {
+		fmt.Printf("Task with filename %v timed out.", task.FileName)
+		task.State = Ready
 	}
 }
 
@@ -101,16 +101,16 @@ func (c *Coordinator) Done() bool {
 
 // Try to get the next mapTask that is available for work
 // If all tasks are already claimed, return false
-func (c *Coordinator) claimNextMapTask() (MapTask, bool) {
+func (c *Coordinator) claimNextMapTask() (*MapTask, bool) {
 	c.fMu.Lock()
 	defer c.fMu.Unlock()
 	for idx, mt := range c.mapTasks {
 		if mt.State == Ready {
 			c.mapTasks[idx].State = Pending
-			return mt, true
+			return &c.mapTasks[idx], true
 		}
 	}
-	return MapTask{}, false
+	return &MapTask{}, false
 }
 
 //
@@ -154,10 +154,10 @@ func (c *Coordinator) RegisterWorker(args *RegisterWorkerArgs, reply *RegisterWo
 func (c *Coordinator) GetMapTask(args *GetMapArgs, reply *GetMapReply) error {
 	reply.PhaseComplete = c.mapDone()
 	reply.AllClaimed = reply.PhaseComplete
-	mt, success := c.claimNextMapTask()
+	pmt, success := c.claimNextMapTask()
 	if success {
-		reply.Task = mt
-		go c.taskTimeout(&mt.State)
+		reply.Task = *pmt
+		go c.mapTaskTimeout(pmt)
 		fmt.Printf("Claimed %v\n", reply.Task.FileName)
 	} else {
 		reply.Task = MapTask{}
