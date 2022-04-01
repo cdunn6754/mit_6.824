@@ -41,7 +41,7 @@ func processMapTask(mapf func(string, string) []KeyValue, task MapTask, nReduce 
 	fileName := task.FileName
 	file, err := os.Open(fileName)
 	if err != nil {
-		log.Fatalf("cannot open %v", fileName)
+		log.Fatalf("cannot open file: %v in map task", fileName)
 		return map[int][]string{}, false
 	}
 	content, err := ioutil.ReadAll(file)
@@ -78,14 +78,53 @@ func processMapTask(mapf func(string, string) []KeyValue, task MapTask, nReduce 
 		enc := json.NewEncoder(ofile)
 		enc.Encode(&kvs)
 	}
-	fmt.Printf("Finished processing: %v\n", fileName)
+	log.Printf("Finished processing: %v\n", fileName)
 	return onames, true
 }
 
+func processReduceTask(reducef func(string, []string) string, task ReduceTask, nReduce int) bool {
+	// Map to store the key -> list of related strings
+	rmap := map[string][]string{}
+	for _, filename := range task.MapFiles {
+		content, err := ioutil.ReadFile(filename)
+		if err != nil {
+			log.Fatalf("Cannot open filename: %v during reduce task.\n", filename)
+			return false
+		}
+		var data []KeyValue
+		err = json.Unmarshal(content, &data)
+		if err != nil {
+			log.Fatalf("Error unmarshaling reduce file %v\n", filename)
+		}
+		for _, kv := range data {
+			rmap[kv.Key] = append(rmap[kv.Key], kv.Value)
+		}
+	}
+	keyList := []string{}
+	for key := range rmap {
+		keyList = append(keyList, key)
+	}
+	sort.Slice(keyList, func(i, j int) bool { return i < j })
+	oname := fmt.Sprintf("mr-out-%d", task.TaskNum)
+	ofile, _ := os.Create(oname)
+	defer ofile.Close()
+
+	for _, key := range keyList {
+		fmt.Fprintf(ofile, "%v %v\n", key, reducef(key, rmap[key]))
+	}
+	log.Printf("Finished processing reduce task: %v\n", task.TaskNum)
+	return true
+}
+
 //
-// Process map tasks until all are finished, then return
+// main/mrworker.go calls this function.
 //
-func handleMapPhase(mapf func(string, string) []KeyValue, workerId int, nReduce int) {
+func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+	nReduce, workerId, success := register()
+	if !success {
+		log.Fatalf("Error initializing worker")
+		return
+	}
 	for true {
 		reply, success := getTask()
 		if !success {
@@ -94,6 +133,9 @@ func handleMapPhase(mapf func(string, string) []KeyValue, workerId int, nReduce 
 			log.Fatal("Retrying in a second...")
 			time.Sleep(time.Second)
 			continue
+		} else if reply.Finished {
+			log.Printf("\nFinished with work.")
+			break
 		} else if reply.AllClaimed {
 			// The phase isn't done, but all of the tasks are claimed, presumably another worker is
 			// working on the last one
@@ -112,35 +154,26 @@ func handleMapPhase(mapf func(string, string) []KeyValue, workerId int, nReduce 
 				log.Fatal("Retrying in a second...")
 				time.Sleep(time.Second)
 			}
+		} else {
+			// It's a reduce task
+			task := reply.ReduceTask
+			success = processReduceTask(reducef, task, nReduce)
+			if success {
+				pushReduceDone(task.TaskNum, workerId)
+				time.Sleep(time.Second)
+				continue
+			} else {
+				log.Fatalf("Reduce task %d failed for worker %d", task.TaskNum, workerId)
+				log.Fatal("Retrying in a second...")
+				time.Sleep(time.Second)
+			}
 		}
 	}
 }
 
 //
-// main/mrworker.go calls this function.
-//
-func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
-	nReduce, workerId, success := register()
-	if !success {
-		log.Fatalf("Error initializing worker")
-		return
-	}
-	handleMapPhase(mapf, workerId, nReduce)
-}
-
-//
 // RPC stubs
 //
-func getMapTask() (GetMapReply, bool) {
-	// Get the next map task, return false if RPC was not successful
-	args := GetMapArgs{}
-	reply := GetMapReply{}
-	success := call("Coordinator.GetMapTask", &args, &reply)
-	if !success {
-		return GetMapReply{}, false
-	}
-	return reply, true
-}
 
 func getTask() (GetTaskReply, bool) {
 	reply := GetTaskReply{}
@@ -149,6 +182,14 @@ func getTask() (GetTaskReply, bool) {
 		return GetTaskReply{}, false
 	}
 	return reply, true
+}
+
+func pushReduceDone(taskNum int, workerId int) {
+	args := PushReduceDoneArgs{
+		TaskNum:  taskNum,
+		WorkerId: workerId,
+	}
+	call("Coordinator.PushReduceDone", &args, &PushReduceDoneReply{})
 }
 
 func pushMapDone(fileName string, outNames map[int][]string, taskNum int, workerId int) {

@@ -32,8 +32,15 @@ type GetTaskReply struct {
 	Finished   bool
 }
 
+type PushReduceDoneArgs struct {
+	TaskNum  int
+	WorkerId int
+}
+type PushReduceDoneReply struct{}
+
 type PushMapDoneArgs struct {
 	FileName string
+	// map reduce number -> slice of file names, probably a single one per reduce num though right?
 	OutNames map[int][]string
 	TaskNum  int
 	WorkerId int

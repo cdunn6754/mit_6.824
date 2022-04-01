@@ -52,7 +52,7 @@ func (c *Coordinator) mapTaskTimeout(task *MapTask) {
 	c.fMu.Lock()
 	defer c.fMu.Unlock()
 	if task.State == Pending {
-		fmt.Printf("Map task with filename %v timed out and was set to ready.", task.FileName)
+		log.Printf("Map task with filename %v timed out and was set to ready.\n", task.FileName)
 		task.State = Ready
 	}
 }
@@ -62,13 +62,13 @@ func (c *Coordinator) reduceTaskTimeout(task *ReduceTask) {
 	c.fMu.Lock()
 	defer c.fMu.Unlock()
 	if task.State == Pending {
-		fmt.Printf("Reduce task number %v timed out and was set to ready.", task.TaskNum)
+		log.Printf("Reduce task number %v timed out and was set to ready.\n", task.TaskNum)
 		task.State = Ready
 	}
 }
 
 //
-// start a thread that listens for RPCs from worker.go
+// Start an RPC server to listen for the workers
 //
 func (c *Coordinator) server() {
 	fmt.Print("Server running, waiting for worker registration... \n")
@@ -110,14 +110,7 @@ func (c *Coordinator) reduceDone() bool {
 // if the entire job has finished.
 //
 func (c *Coordinator) Done() bool {
-	if c.mapDone() {
-		// Temporary to check that all of the reducer tasks have the correct files assigned
-		for _, task := range c.reduceTasks {
-			fmt.Printf("Reducer task Files: %v\n", task.MapFiles)
-		}
-		return true
-	}
-	return false
+	return c.mapDone() && c.reduceDone()
 }
 
 // Try to get the next mapTask that is available for work
@@ -156,7 +149,6 @@ func (c *Coordinator) claimNextReduceTask() (*ReduceTask, bool) {
 //
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	mapTasks := make([]MapTask, 0)
-	reduceTasks := make([]ReduceTask, nReduce)
 	for idx, filename := range files {
 		mapTask := MapTask{
 			State:    Ready,
@@ -164,6 +156,14 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			TaskNum:  idx,
 		}
 		mapTasks = append(mapTasks, mapTask)
+	}
+	reduceTasks := make([]ReduceTask, nReduce)
+	for idx := range reduceTasks {
+		// Make the TaskNum match the index in the array
+		// This helps later so that we know which reduce tasks correspond to which
+		// map outputs
+		prt := &reduceTasks[idx]
+		prt.TaskNum = idx
 	}
 	c := Coordinator{
 		mapTasks:    mapTasks,
@@ -178,11 +178,11 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 func (c *Coordinator) RegisterWorker(args *RegisterWorkerArgs, reply *RegisterWorkerReply) error {
 	reply.NReduce = c.nReduce
-	reply.WorkerId = len(c.workers) + 1
 	c.fMu.Lock()
 	defer c.fMu.Unlock()
+	reply.WorkerId = len(c.workers) + 1
 	c.workers = append(c.workers, WorkerInstance{id: reply.WorkerId})
-	fmt.Printf("Registered worker: %v\n", reply.WorkerId)
+	log.Printf("Registered worker: %v\n", reply.WorkerId)
 	return nil
 }
 
@@ -193,7 +193,7 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	// is pending, represent that state with AllClaimed = true
 	reply.AllClaimed = false
 	// Finished is true when both the map and reduce phases are complete
-	reply.Finished = false
+	reply.Finished = c.Done()
 	// Check which phase we are in, map vs reduce
 	if !c.mapDone() {
 		reply.Type = Map
@@ -201,10 +201,10 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 		if success {
 			reply.MapTask = *pmt
 			go c.mapTaskTimeout(pmt)
-			fmt.Printf("Claimed map task with filename: %v\n", pmt.FileName)
+			log.Printf("Claimed map task with filename: %v\n", pmt.FileName)
 		} else {
 			reply.AllClaimed = true
-			fmt.Print("All map tasks claimed.\n")
+			log.Print("All map tasks claimed.\n")
 		}
 	} else if !c.reduceDone() {
 		reply.Type = Reduce
@@ -212,30 +212,28 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 		if success {
 			reply.ReduceTask = *prt
 			go c.reduceTaskTimeout(prt)
-			fmt.Printf("Claimed reduce task number :%v\n", prt.TaskNum)
+			log.Printf("Claimed reduce task number: %v\n", prt.TaskNum)
 		} else {
 			reply.AllClaimed = true
-			fmt.Print("All map tasks claimed.\n")
+			log.Print("All reduce tasks claimed.\n")
 		}
 	}
 	return nil
 }
 
-// Try to get a new map task to send to the worker.
-func (c *Coordinator) GetMapTask(args *GetMapArgs, reply *GetMapReply) error {
-	reply.PhaseComplete = c.mapDone()
-	reply.AllClaimed = reply.PhaseComplete
-	pmt, success := c.claimNextMapTask()
-	if success {
-		reply.Task = *pmt
-		go c.mapTaskTimeout(pmt)
-		fmt.Printf("Claimed %v\n", reply.Task.FileName)
-	} else {
-		reply.Task = MapTask{}
-		reply.AllClaimed = true
-		if !reply.PhaseComplete {
-			fmt.Print("All map tasks claimed.\n")
+func (c *Coordinator) PushReduceDone(args *PushReduceDoneArgs, reply *PushReduceDoneReply) error {
+	c.fMu.Lock()
+	defer c.fMu.Unlock()
+	found := false
+	for idx, rt := range c.reduceTasks {
+		if rt.TaskNum == args.TaskNum {
+			found = true
+			c.reduceTasks[idx].State = Complete
 		}
+	}
+	if !found {
+		return fmt.Errorf("Could not find reducetask for reduce number: %v, worker id: %v",
+			args.TaskNum, args.WorkerId)
 	}
 	return nil
 }
