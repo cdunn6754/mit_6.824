@@ -52,8 +52,12 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type LogTerm struct {
+	messages []string
+}
+
 type Log struct {
-	content string
+	terms []LogTerm
 }
 
 //
@@ -71,7 +75,7 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// Persisted
-	logs        []Log
+	logs        Log
 	votedFor    int
 	currentTerm int
 
@@ -137,7 +141,7 @@ func (rf *Raft) readPersist(data []byte) {
 
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	var logs []Log
+	var logs Log
 	var votedFor int
 	var currentTerm int
 	if d.Decode(&logs) != nil || d.Decode(&votedFor) != nil || d.Decode(&currentTerm) != nil {
@@ -175,6 +179,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	term         int
+	candidateId  int
+	lastLogIndex int
+	lastLogTerm  int
 }
 
 //
@@ -182,7 +190,8 @@ type RequestVoteArgs struct {
 // field names must start with capital letters!
 //
 type RequestVoteReply struct {
-	// Your data here (2A).
+	term        int
+	voteGranted bool
 }
 
 //
@@ -190,6 +199,22 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	reply.term = rf.currentTerm
+	noVote := rf.votedFor == -1 || rf.votedFor == args.candidateId
+	newCandidateTerm := args.term > rf.currentTerm
+	// make sure we are using the persisted log for this comparison
+	rf.readPersist(rf.persister.ReadRaftState())
+	terms := rf.logs.terms
+	lastTermMessages := terms[len(terms)-1].messages
+	// Either the candidate has more committed log terms than this server, or the terms are the same and the
+	// candidate has at least all of the committed log messages of this server
+	newCandidateLog := (args.lastLogTerm == len(terms)-1 && args.lastLogIndex >= len(lastTermMessages)-1) ||
+		args.lastLogTerm > len(terms)-1
+	if newCandidateTerm && noVote && newCandidateLog {
+		reply.voteGranted = true
+		return
+	}
+	reply.voteGranted = false
 }
 
 //
