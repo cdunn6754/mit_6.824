@@ -18,14 +18,16 @@ package raft
 //
 
 import (
-//	"bytes"
+	//	"bytes"
+	"bytes"
+	"log"
 	"sync"
 	"sync/atomic"
 
-//	"6.824/labgob"
+	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -50,6 +52,10 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type Log struct {
+	content string
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -64,6 +70,14 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// Persisted
+	logs        []Log
+	votedFor    int
+	currentTerm int
+
+	// Volatile leader info, both nil for followers and candidates
+	nextIndex  []int
+	matchIndex []int
 }
 
 // return currentTerm and whether this server
@@ -90,8 +104,15 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
-}
 
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.logs)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.currentTerm)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+}
 
 //
 // restore previously persisted state.
@@ -113,8 +134,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
-}
 
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var logs []Log
+	var votedFor int
+	var currentTerm int
+	if d.Decode(&logs) != nil || d.Decode(&votedFor) != nil || d.Decode(&currentTerm) != nil {
+		log.Fatalf("Error reading persisted data on server: %v", rf.me)
+	} else {
+		rf.logs = logs
+		rf.votedFor = votedFor
+		rf.currentTerm = currentTerm
+	}
+}
 
 //
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -135,7 +168,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 
 }
-
 
 //
 // example RequestVote RPC arguments structure.
@@ -194,7 +226,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -215,7 +246,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -278,7 +308,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 
 	return rf
 }
