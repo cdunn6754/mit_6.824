@@ -179,10 +179,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	term         int
-	candidateId  int
-	lastLogIndex int
-	lastLogTerm  int
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -190,8 +190,8 @@ type RequestVoteArgs struct {
 // field names must start with capital letters!
 //
 type RequestVoteReply struct {
-	term        int
-	voteGranted bool
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -199,22 +199,24 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	reply.term = rf.currentTerm
-	noVote := rf.votedFor == -1 || rf.votedFor == args.candidateId
-	newCandidateTerm := args.term > rf.currentTerm
-	// make sure we are using the persisted log for this comparison
+	// Make sure we are using the persisted log for this comparison
 	rf.readPersist(rf.persister.ReadRaftState())
+
+	reply.Term = rf.currentTerm
+	noVote := rf.votedFor == -1 || rf.votedFor == args.CandidateId
+	newCandidateTerm := args.Term > rf.currentTerm
+
 	terms := rf.logs.terms
 	lastTermMessages := terms[len(terms)-1].messages
 	// Either the candidate has more committed log terms than this server, or the terms are the same and the
 	// candidate has at least all of the committed log messages of this server
-	newCandidateLog := (args.lastLogTerm == len(terms)-1 && args.lastLogIndex >= len(lastTermMessages)-1) ||
-		args.lastLogTerm > len(terms)-1
+	newCandidateLog := (args.LastLogTerm == len(terms)-1 && args.LastLogIndex >= len(lastTermMessages)-1) ||
+		args.LastLogTerm > len(terms)-1
 	if newCandidateTerm && noVote && newCandidateLog {
-		reply.voteGranted = true
+		reply.VoteGranted = true
 		return
 	}
-	reply.voteGranted = false
+	reply.VoteGranted = false
 }
 
 //
