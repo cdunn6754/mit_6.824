@@ -21,8 +21,10 @@ import (
 	//	"bytes"
 	"bytes"
 	"log"
+	"math/rand"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	//	"6.824/labgob"
 	"6.824/labgob"
@@ -53,7 +55,7 @@ type ApplyMsg struct {
 }
 
 type LogTerm struct {
-	messages []string
+	entries []string
 }
 
 type Log struct {
@@ -64,11 +66,12 @@ type Log struct {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
-	dead      int32               // set by Kill()
+	mu          sync.Mutex          // Lock to protect shared access to this peer's state
+	peers       []*labrpc.ClientEnd // RPC end points of all peers
+	persister   *Persister          // Object to hold this peer's persisted state
+	me          int                 // this peer's index into peers[]
+	dead        int32               // set by Kill()
+	timeoutChan chan time.Time
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -173,6 +176,60 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []string
+	LeaderCommit int
+}
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// Make sure we are using the persisted log for this comparison
+	rf.readPersist(rf.persister.ReadRaftState())
+	reply.Term = rf.currentTerm
+
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+		return
+	}
+	terms := rf.logs.terms
+	if args.PrevLogTerm > len(terms) {
+		// The previous term is not present in this rf
+		reply.Success = false
+		return
+	}
+	// This rf has the term, now check that it has the entry
+	entries := &terms[args.PrevLogTerm-1].entries
+	if args.PrevLogIndex+1 > len(*entries) {
+		// This rf doesn't have the previous log entry
+		reply.Success = false
+		return
+	}
+	// Got a good heartbeat
+	now := time.Now()
+	select {
+	case rf.timeoutChan <- now:
+		log.Printf("Sending heatbeat %v.\n", now)
+	default:
+		log.Println("Already a heartbeat in the channel, not sending.")
+
+	}
+
+	reply.Success = true
+	return
+
+	// Needed for later, now the entries will be empty
+	// Actually truncate and then store new logs
+	// *entries = (*entries)[:args.PrevLogIndex]
+	// *entries = append(*entries, args.Entries...)
+}
+
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -207,10 +264,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	newCandidateTerm := args.Term > rf.currentTerm
 
 	terms := rf.logs.terms
-	lastTermMessages := terms[len(terms)-1].messages
+	lastTermEntries := terms[len(terms)-1].entries
 	// Either the candidate has more committed log terms than this server, or the terms are the same and the
 	// candidate has at least all of the committed log messages of this server
-	newCandidateLog := (args.LastLogTerm == len(terms)-1 && args.LastLogIndex >= len(lastTermMessages)-1) ||
+	newCandidateLog := (args.LastLogTerm == len(terms)-1 && args.LastLogIndex >= len(lastTermEntries)-1) ||
 		args.LastLogTerm > len(terms)-1
 	if newCandidateTerm && noVote && newCandidateLog {
 		reply.VoteGranted = true
@@ -306,7 +363,15 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-
+		timeToSleep := float32(time.Millisecond*500) + float32(time.Millisecond*250*time.Duration(rand.Float32()))
+		time.Sleep(time.Duration(timeToSleep))
+		select {
+		case heartBeatTime := <-rf.timeoutChan:
+			log.Printf("Heartbeat received at %v, I won't be seeking election.\n", heartBeatTime)
+		default:
+			log.Print("Heartbeat not received within time, I am excited to announce my candidacy.\n")
+			// TODO send the request to all the other servers
+		}
 	}
 }
 
@@ -327,6 +392,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.timeoutChan = make(chan time.Time)
 
 	// Your initialization code here (2A, 2B, 2C).
 
