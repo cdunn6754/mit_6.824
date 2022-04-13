@@ -66,12 +66,12 @@ type Log struct {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu          sync.Mutex          // Lock to protect shared access to this peer's state
-	peers       []*labrpc.ClientEnd // RPC end points of all peers
-	persister   *Persister          // Object to hold this peer's persisted state
-	me          int                 // this peer's index into peers[]
-	dead        int32               // set by Kill()
-	timeoutChan chan time.Time
+	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	peers     []*labrpc.ClientEnd // RPC end points of all peers
+	persister *Persister          // Object to hold this peer's persisted state
+	me        int                 // this peer's index into peers[]
+	dead      int32               // set by Kill()
+	heartbeat bool                // Flag set to true when a heartbeat is received, set to False by ticker before sleeping
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -190,6 +190,8 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	// Make sure we are using the persisted log for this comparison
 	rf.readPersist(rf.persister.ReadRaftState())
 	reply.Term = rf.currentTerm
@@ -211,15 +213,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
-	// Got a good heartbeat
-	now := time.Now()
-	select {
-	case rf.timeoutChan <- now:
-		log.Printf("Sending heatbeat %v.\n", now)
-	default:
-		log.Println("Already a heartbeat in the channel, not sending.")
-
-	}
+	rf.heartbeat = true
+	log.Print("Successfully received heartbeat received from the fearlessg leader.")
 
 	reply.Success = true
 	return
@@ -257,6 +252,8 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// Make sure we are using the persisted log for this comparison
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.readPersist(rf.persister.ReadRaftState())
 
 	reply.Term = rf.currentTerm
@@ -363,14 +360,15 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		timeToSleep := float32(time.Millisecond*500) + float32(time.Millisecond*250*time.Duration(rand.Float32()))
+		rf.mu.Lock()
+		rf.heartbeat = false
+		rf.mu.Unlock()
+		timeToSleep := float32(time.Millisecond*500) + float32(time.Millisecond*500*time.Duration(rand.Float32()))
 		time.Sleep(time.Duration(timeToSleep))
-		select {
-		case heartBeatTime := <-rf.timeoutChan:
-			log.Printf("Heartbeat received at %v, I won't be seeking election.\n", heartBeatTime)
-		default:
-			log.Print("Heartbeat not received within time, I am excited to announce my candidacy.\n")
-			// TODO send the request to all the other servers
+		if rf.heartbeat {
+			log.Println("Heartbeat received, I won't be seeking election.")
+		} else {
+			log.Println("Heartbeat not received within timeout, I am excited to announce my candidacy.")
 		}
 	}
 }
@@ -392,7 +390,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.timeoutChan = make(chan time.Time)
+	rf.heartbeat = false
 
 	// Your initialization code here (2A, 2B, 2C).
 
