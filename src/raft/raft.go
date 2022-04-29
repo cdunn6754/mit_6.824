@@ -106,11 +106,15 @@ func (rf Raft) isFollower() bool {
 }
 
 func (rf *Raft) lastLogTerm() (int, LogTerm) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	idx := len(rf.logs.terms) - 1
 	return idx, rf.logs.terms[idx]
 }
 
 func (rf *Raft) lastLog() (int, string) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	_, term := rf.lastLogTerm()
 	idx := len(term.entries) - 1
 	return idx, term.entries[idx]
@@ -279,7 +283,6 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	reply.Term = rf.currentTerm
 	noVote := rf.votedFor == -1 || rf.votedFor == args.CandidateId
@@ -287,6 +290,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	terms := rf.logs.terms
 	lastTermEntries := terms[len(terms)-1].entries
+	rf.mu.Unlock()
+
 	// Either the candidate has more committed log terms than this server, or the terms are the same and the
 	// candidate has at least all of the committed log messages of this server
 	newCandidateLog := (args.LastLogTerm == len(terms)-1 && args.LastLogIndex >= len(lastTermEntries)-1) ||
@@ -376,24 +381,24 @@ func getTimeToSleep() time.Duration {
 func (rf *Raft) campaign() bool {
 	// Channel for each goroutine to share to describe the vote result
 	resultChan := make(chan bool)
-	// Initiate requests to all peers
 	rf.mu.Lock()
+	rf.currentTerm += 1
+	currentTerm := rf.currentTerm
+	rf.mu.Unlock()
+	// This should all be threadsafe, we don't change rf.peers, or rf.me, and lastLog fcns are threadsafe
+	// Initiate requests to all peers
 	for peerIdx := range rf.peers {
 		if peerIdx != rf.me {
 			go func(resultChan chan bool) {
-				rf.mu.Lock()
 				logIdx, _ := rf.lastLog()
 				termIdx, _ := rf.lastLogTerm()
 				args := &RequestVoteArgs{
-					Term:         rf.currentTerm,
+					Term:         currentTerm,
 					CandidateId:  rf.me,
 					LastLogIndex: logIdx,
-					LastLogTerm:  termIdx,
+					LastLogTerm:  termIdx + 1, // Not an index, the actual term number is needed here
 				}
 				reply := &RequestVoteReply{}
-				rf.mu.Lock()
-				// Should I send the peer itself here? I don't want to lock
-				// over the sendRequestVote, because it is a long blocking fcn
 				success := rf.sendRequestVote(peerIdx, args, reply)
 				if success && reply.VoteGranted {
 					resultChan <- true
@@ -403,7 +408,6 @@ func (rf *Raft) campaign() bool {
 		}
 
 	}
-	rf.mu.Unlock()
 
 	// Wait for results to come back in
 	yesVotes := 0
@@ -430,7 +434,7 @@ func (rf *Raft) campaign() bool {
 			}
 		}
 	}
-
+	// If this peer is killed, just return false to shutdown nicely
 	return false
 }
 
@@ -452,7 +456,7 @@ func (rf *Raft) ticker() {
 		}
 		rf.mu.Unlock()
 		log.Println("Heartbeat not received within timeout, I am excited to announce my candidacy.")
-		result = rf.campaign()
+		result := rf.campaign()
 	}
 }
 
