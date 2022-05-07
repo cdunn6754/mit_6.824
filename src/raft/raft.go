@@ -62,6 +62,11 @@ type Log struct {
 	terms []LogTerm
 }
 
+type LogEntry struct {
+	message string
+	term    int
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -80,13 +85,19 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// Persisted
-	logs        Log
+	log         []LogEntry
 	votedFor    int
 	currentTerm int
 
 	// Volatile leader info, both nil for followers and candidates
 	nextIndex  []int
 	matchIndex []int
+}
+
+// Update the Raft log to the provided log, persist raft to durable storage
+func (rf *Raft) updateLog(newLog []LogEntry) {
+	rf.log = newLog
+	rf.persist()
 }
 
 func (rf *Raft) isLeader() bool {
@@ -103,21 +114,6 @@ func (rf *Raft) isLeader() bool {
 
 func (rf Raft) isFollower() bool {
 	return !rf.isLeader() && !rf.isCandidate
-}
-
-func (rf *Raft) lastLogTerm() (int, LogTerm) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	idx := len(rf.logs.terms) - 1
-	return idx, rf.logs.terms[idx]
-}
-
-func (rf *Raft) lastLog() (int, string) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	_, term := rf.lastLogTerm()
-	idx := len(term.entries) - 1
-	return idx, term.entries[idx]
 }
 
 // return currentTerm and whether this server
@@ -143,7 +139,7 @@ func (rf *Raft) persist() {
 
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	e.Encode(rf.logs)
+	e.Encode(rf.log)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.currentTerm)
 	data := w.Bytes()
@@ -173,13 +169,13 @@ func (rf *Raft) readPersist(data []byte) {
 
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	var logs Log
+	var _log []LogEntry
 	var votedFor int
 	var currentTerm int
-	if d.Decode(&logs) != nil || d.Decode(&votedFor) != nil || d.Decode(&currentTerm) != nil {
+	if d.Decode(&_log) != nil || d.Decode(&votedFor) != nil || d.Decode(&currentTerm) != nil {
 		log.Fatalf("Error reading persisted data on server: %v", rf.me)
 	} else {
-		rf.logs = logs
+		rf.log = _log
 		rf.votedFor = votedFor
 		rf.currentTerm = currentTerm
 	}
@@ -227,33 +223,39 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
-	terms := rf.logs.terms
-	if args.PrevLogTerm > len(terms) {
-		// The previous term is not present in this rf
-		reply.Success = false
-		return
+	// At startup the leader won't have a log, and PrevLogIndex == -1
+	if args.PrevLogIndex >= 0 {
+		// Otherwise make sure that this log contains an entry at PrevLogIndex
+		if args.PrevLogIndex >= len(rf.log) {
+			reply.Success = false
+			return
+		}
+		// Check that the term matches, otherwise drop it from this log and fail
+		log_entry := rf.log[args.PrevLogIndex]
+		if log_entry.term != args.PrevLogTerm {
+			rf.updateLog(rf.log[:args.PrevLogIndex])
+			reply.Success = false
+			return
+		}
+	} else {
+		// The leader has an empty log. Empty this log too and reply success.
+		// This is a weird state, to be in. Maybe this should fail instead? But I'm not sure
+		// what the leader would do then.
+		if len(rf.log) > 0 {
+			rf.updateLog(nil)
+		}
 	}
-	// This rf has the term, now check that it has the entry
-	entries := &terms[args.PrevLogTerm-1].entries
-	if args.PrevLogIndex+1 > len(*entries) {
-		// This rf doesn't have the previous log entry
-		reply.Success = false
-		return
-	}
+	// Looks good, now append the new entries
+	reply.Success = true
+	// A successful message from the leader was received, reset heartbeat
 	rf.heartbeat = true
 	// After a successful heartbeat, the election is over
 	rf.votedFor = -1
 	// It's a follower now, maybe isCandidate and votedFor can be combined to a single variable
 	rf.isCandidate = false
 	log.Print("Successfully received heartbeat received from the fearless leader.")
-
-	reply.Success = true
-	return
-
 	// Needed for later, now the entries will be empty
-	// Actually truncate and then store new logs
-	// *entries = (*entries)[:args.PrevLogIndex]
-	// *entries = append(*entries, args.Entries...)
+	// Actually truncate and then store new
 }
 
 //
@@ -283,22 +285,16 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
-
+	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
+
+	// Check on the RAFT algorithm logic here
+	validCandidateTerm := args.Term >= rf.currentTerm
 	noVote := rf.votedFor == -1 || rf.votedFor == args.CandidateId
-	newCandidateTerm := args.Term > rf.currentTerm
-
-	terms := rf.logs.terms
-	lastTermEntries := terms[len(terms)-1].entries
-	rf.mu.Unlock()
-
-	// Either the candidate has more committed log terms than this server, or the terms are the same and the
-	// candidate has at least all of the committed log messages of this server
-	newCandidateLog := (args.LastLogTerm == len(terms)-1 && args.LastLogIndex >= len(lastTermEntries)-1) ||
-		args.LastLogTerm > len(terms)-1
-	if newCandidateTerm && noVote && newCandidateLog {
+	validCandidateLog := args.LastLogIndex >= len(rf.log)
+	if validCandidateTerm && noVote && validCandidateLog {
 		reply.VoteGranted = true
-		return
+		rf.votedFor = args.CandidateId
 	}
 	reply.VoteGranted = false
 }
@@ -384,35 +380,41 @@ func (rf *Raft) campaign() bool {
 	rf.mu.Lock()
 	rf.currentTerm += 1
 	currentTerm := rf.currentTerm
+	var lastLogTerm int
+	if rf.log == nil {
+		lastLogTerm = 0
+	} else {
+		lastLogTerm = rf.log[len(rf.log)-1].term
+	}
 	rf.mu.Unlock()
 	// This should all be threadsafe, we don't change rf.peers, or rf.me, and lastLog fcns are threadsafe
 	// Initiate requests to all peers
 	for peerIdx := range rf.peers {
 		if peerIdx != rf.me {
 			go func(resultChan chan bool) {
-				logIdx, _ := rf.lastLog()
-				termIdx, _ := rf.lastLogTerm()
+				logIdx := len(rf.log)
+
 				args := &RequestVoteArgs{
 					Term:         currentTerm,
 					CandidateId:  rf.me,
 					LastLogIndex: logIdx,
-					LastLogTerm:  termIdx + 1, // Not an index, the actual term number is needed here
+					LastLogTerm:  lastLogTerm,
 				}
 				reply := &RequestVoteReply{}
 				success := rf.sendRequestVote(peerIdx, args, reply)
 				if success && reply.VoteGranted {
 					resultChan <- true
+				} else {
+					resultChan <- false
 				}
-				resultChan <- false
 			}(resultChan)
 		}
-
 	}
 
 	// Wait for results to come back in
+	// But only wait until the election timeout is up
 	yesVotes := 0
 	votesReceived := 0
-	rf.mu.Lock()
 	voterCount := len(rf.peers) - 1
 	for rf.killed() == false {
 		select {
@@ -439,7 +441,7 @@ func (rf *Raft) campaign() bool {
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
-// heartsbeats recently.
+// heartbeats recently.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		// Your code here to check if a leader election should
@@ -477,10 +479,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+
+	// Your initialization code here (2A, 2B, 2C).
 	rf.heartbeat = false
 	rf.isCandidate = false
 
-	// Your initialization code here (2A, 2B, 2C).
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.log = nil
+	rf.nextIndex = nil
+	rf.matchIndex = nil
+	// rf.lastApplied = -1
+	// rf.commitIndex = -1
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
