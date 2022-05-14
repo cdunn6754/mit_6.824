@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 	"bytes"
+	"context"
 	"log"
 	"math/rand"
 	"sync"
@@ -71,13 +72,13 @@ type LogEntry struct {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu          sync.Mutex          // Lock to protect shared access to this peer's state
-	peers       []*labrpc.ClientEnd // RPC end points of all peers
-	persister   *Persister          // Object to hold this peer's persisted state
-	me          int                 // this peer's index into peers[]
-	dead        int32               // set by Kill()
-	heartbeat   bool                // Flag set to true when a heartbeat is received, set to False by ticker before sleeping
-	isCandidate bool                // Indicates the state of this worker, along with the nilness of nextIndex/matchIndex the state can be
+	mu            sync.Mutex          // Lock to protect shared access to this peer's state
+	peers         []*labrpc.ClientEnd // RPC end points of all peers
+	persister     *Persister          // Object to hold this peer's persisted state
+	me            int                 // this peer's index into peers[]
+	dead          int32               // set by Kill()
+	isCandidate   bool                // Indicates the state of this worker, along with the nilness of nextIndex/matchIndex the state can be
+	heartbeatChan chan struct{}       // Channel to indicate a successful heartbeat
 	// fully determined: candidate, follower, or leader
 
 	// Your data here (2A, 2B, 2C).
@@ -248,10 +249,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Looks good, now append the new entries
 	reply.Success = true
 	// A successful message from the leader was received, reset heartbeat
-	rf.heartbeat = true
+	rf.heartbeatChan <- struct{}{}
 	// After a successful heartbeat, the election is over
 	rf.votedFor = -1
-	// It's a follower now, maybe isCandidate and votedFor can be combined to a single variable
+	// It's a follower now
 	rf.isCandidate = false
 	log.Print("Successfully received heartbeat received from the fearless leader.")
 	// Needed for later, now the entries will be empty
@@ -374,11 +375,12 @@ func getTimeToSleep() time.Duration {
 	return time.Millisecond*500 + time.Duration(rand.Intn(500))*time.Millisecond
 }
 
-func (rf *Raft) campaign() bool {
+func (rf *Raft) campaign(ctx context.Context) bool {
 	// Channel for each goroutine to share to describe the vote result
 	resultChan := make(chan bool)
 	rf.mu.Lock()
 	rf.currentTerm += 1
+	rf.persist()
 	currentTerm := rf.currentTerm
 	var lastLogTerm int
 	if rf.log == nil {
@@ -386,14 +388,13 @@ func (rf *Raft) campaign() bool {
 	} else {
 		lastLogTerm = rf.log[len(rf.log)-1].term
 	}
+	logIdx := len(rf.log)
 	rf.mu.Unlock()
-	// This should all be threadsafe, we don't change rf.peers, or rf.me, and lastLog fcns are threadsafe
+	// This should all be threadsafe, we don't change rf.peers, or rf.me
 	// Initiate requests to all peers
 	for peerIdx := range rf.peers {
 		if peerIdx != rf.me {
 			go func(resultChan chan bool) {
-				logIdx := len(rf.log)
-
 				args := &RequestVoteArgs{
 					Term:         currentTerm,
 					CandidateId:  rf.me,
@@ -418,8 +419,13 @@ func (rf *Raft) campaign() bool {
 	voterCount := len(rf.peers) - 1
 	for rf.killed() == false {
 		select {
-		case <-time.After(getTimeToSleep()):
-			log.Printf("Raft: %v timed out while campaigning", rf.me)
+		case <-ctx.Done():
+			// This leads to waiting an extra timeout before campaining resumes, that's against the spec
+			// but I think it should be fine.
+			log.Printf("Raft: %v timed out while campaigning\n", rf.me)
+			return false
+		case <-rf.heartbeatChan:
+			log.Printf("Raft: %v received valid heartbeat while campaining, switching to follower mode\n", rf.me)
 			return false
 		case result := <-resultChan:
 			votesReceived += 1
@@ -431,6 +437,8 @@ func (rf *Raft) campaign() bool {
 				return true
 			}
 			// If we got all the votes and still no majority we lost
+			// I guess we don't have to hear from all of them to determine that, but let's
+			// keep it simple
 			if votesReceived == voterCount {
 				return false
 			}
@@ -444,21 +452,17 @@ func (rf *Raft) campaign() bool {
 // heartbeats recently.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-		// Your code here to check if a leader election should
-		// be started and to randomize sleeping time using
-		// time.Sleep().
-		rf.mu.Lock()
-		rf.heartbeat = false
-		rf.mu.Unlock()
-		time.Sleep(time.Duration(getTimeToSleep()))
-		rf.mu.Lock()
-		if rf.heartbeat {
-			log.Println("Heartbeat received, I won't be seeking election.")
-			continue
+		select {
+		case <-time.After(getTimeToSleep()):
+			log.Println("Heartbeat not received within timeout, I am excited to announce my candidacy.")
+			ctx, cancel := context.WithTimeout(context.Background(), getTimeToSleep())
+			if rf.campaign(ctx) {
+				// I don't know, switch to leader
+			}
+			cancel()
+		case <-rf.heartbeatChan:
+			log.Println("heartbeat received, I won't be seeking election.")
 		}
-		rf.mu.Unlock()
-		log.Println("Heartbeat not received within timeout, I am excited to announce my candidacy.")
-		result := rf.campaign()
 	}
 }
 
@@ -481,9 +485,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.heartbeat = false
 	rf.isCandidate = false
-
+	rf.heartbeatChan = make(chan struct{})
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.log = nil
