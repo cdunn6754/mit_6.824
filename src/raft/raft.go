@@ -90,6 +90,10 @@ type Raft struct {
 	votedFor    int
 	currentTerm int
 
+	// Volatile for all servers
+	// commitIndex int
+	// lastApplied int
+
 	// Volatile leader info, both nil for followers and candidates
 	nextIndex  []int
 	matchIndex []int
@@ -113,9 +117,9 @@ func (rf *Raft) isLeader() bool {
 	return false
 }
 
-func (rf Raft) isFollower() bool {
-	return !rf.isLeader() && !rf.isCandidate
-}
+// func (rf Raft) isFollower() bool {
+// 	return !rf.isLeader() && !rf.isCandidate
+// }
 
 // return currentTerm and whether this server
 // believes it is the leader.
@@ -257,6 +261,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	log.Print("Successfully received heartbeat received from the fearless leader.")
 	// Needed for later, now the entries will be empty
 	// Actually truncate and then store new
+}
+
+func (rf *Raft) sendAppendEntries(peerIdx int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[peerIdx].Call("Raft.AppendEntries", args, reply)
+	return ok
 }
 
 //
@@ -457,13 +466,31 @@ func (rf *Raft) ticker() {
 			log.Println("Heartbeat not received within timeout, I am excited to announce my candidacy.")
 			ctx, cancel := context.WithTimeout(context.Background(), getTimeToSleep())
 			if rf.campaign(ctx) {
-				// I don't know, switch to leader
+				// Get out of the follower loop
+				rf.lead()
 			}
 			cancel()
 		case <-rf.heartbeatChan:
 			log.Println("heartbeat received, I won't be seeking election.")
 		}
 	}
+}
+
+// Take over as the leader server
+func (rf *Raft) lead() {
+	// Start by initializing data structures and sending a one time appendentries
+	// rpc to assert leadership
+	rf.mu.Lock()
+	lastLogIdx := len(rf.log)
+	for idx := range rf.peers {
+		rf.nextIndex[idx] = lastLogIdx + 1
+		rf.matchIndex[idx] = 0
+		args := {
+			Term: rf.
+		}
+	}
+	rf.mu.Unlock()
+
 }
 
 //
