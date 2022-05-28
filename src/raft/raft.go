@@ -243,14 +243,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			return
 		}
 	} else {
-		// The leader has an empty log. Empty this log too and reply success.
+		// The leader has an empty log.
+		// If this rf has a log, empty this log too and reply success.
 		// This is a weird state, to be in. Maybe this should fail instead? But I'm not sure
 		// what the leader would do then.
 		if len(rf.log) > 0 {
 			rf.updateLog(nil)
 		}
 	}
-	// Looks good, now append the new entries
+	// Looks good, now append the new entries, TODO
 	reply.Success = true
 	// A successful message from the leader was received, reset heartbeat
 	rf.heartbeatChan <- struct{}{}
@@ -259,8 +260,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// It's a follower now
 	rf.isCandidate = false
 	log.Print("Successfully received heartbeat received from the fearless leader.")
-	// Needed for later, now the entries will be empty
-	// Actually truncate and then store new
 }
 
 func (rf *Raft) sendAppendEntries(peerIdx int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -426,7 +425,7 @@ func (rf *Raft) campaign(ctx context.Context) bool {
 	yesVotes := 0
 	votesReceived := 0
 	voterCount := len(rf.peers) - 1
-	for rf.killed() == false {
+	for !rf.killed() {
 		select {
 		case <-ctx.Done():
 			// This leads to waiting an extra timeout before campaining resumes, that's against the spec
@@ -460,19 +459,49 @@ func (rf *Raft) campaign(ctx context.Context) bool {
 // The ticker go routine starts a new election if this peer hasn't received
 // heartbeats recently.
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	for !rf.killed() {
 		select {
 		case <-time.After(getTimeToSleep()):
 			log.Println("Heartbeat not received within timeout, I am excited to announce my candidacy.")
 			ctx, cancel := context.WithTimeout(context.Background(), getTimeToSleep())
 			if rf.campaign(ctx) {
-				// Get out of the follower loop
+				// Get out of the follower loop, become  leader
+				cancel()
 				rf.lead()
 			}
 			cancel()
 		case <-rf.heartbeatChan:
 			log.Println("heartbeat received, I won't be seeking election.")
 		}
+	}
+}
+
+func (rf *Raft) sendAllAppendEntries() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	currentTerm := rf.currentTerm
+	for peerIdx := range rf.peers {
+		if peerIdx == rf.me {
+			continue
+		}
+		go func() {
+			// No locks are needed here, rf.me doesn't change
+			// TODO: update PrevLog... and LeaderCommit once data is really sent
+			args := &AppendEntriesArgs{
+				Term:         currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: -1,
+				PrevLogTerm:  currentTerm,
+				Entries:      nil,
+				LeaderCommit: -1,
+			}
+			reply := &AppendEntriesReply{}
+			ok := rf.sendAppendEntries(peerIdx, args, reply)
+			if !ok {
+				// TODO, improve this log when entries are being sent
+				log.Printf("AppendEntries to peer %v failed, lowering log idx to ...", peerIdx)
+			}
+		}()
 	}
 }
 
@@ -483,14 +512,18 @@ func (rf *Raft) lead() {
 	rf.mu.Lock()
 	lastLogIdx := len(rf.log)
 	for idx := range rf.peers {
+		if idx == rf.me {
+			continue
+		}
 		rf.nextIndex[idx] = lastLogIdx + 1
 		rf.matchIndex[idx] = 0
-		args := {
-			Term: rf.
-		}
 	}
 	rf.mu.Unlock()
-
+	for !rf.killed() {
+		// For now, just send heartbeats periodically
+		rf.sendAllAppendEntries()
+		time.Sleep(time.Microsecond * 150)
+	}
 }
 
 //
