@@ -64,8 +64,8 @@ type Log struct {
 }
 
 type LogEntry struct {
-	message string
-	term    int
+	Message string
+	Term    int
 }
 
 //
@@ -77,7 +77,7 @@ type Raft struct {
 	persister     *Persister          // Object to hold this peer's persisted state
 	me            int                 // this peer's index into peers[]
 	dead          int32               // set by Kill()
-	isCandidate   bool                // Indicates the state of this worker, along with the nilness of nextIndex/matchIndex the state can be
+	isCandidate   bool                // Indicates the state of this worker, along with the contents of nextIndex/matchIndex the state can be
 	heartbeatChan chan struct{}       // Channel to indicate a successful heartbeat
 	// fully determined: candidate, follower, or leader
 
@@ -105,16 +105,17 @@ func (rf *Raft) updateLog(newLog []LogEntry) {
 	rf.persist()
 }
 
+// If the nextIndex or matchIndex arrays contain values other than -1
+// this instance is a leader
 func (rf *Raft) isLeader() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.nextIndex != nil && rf.matchIndex != nil {
-		return true
-	} else if rf.nextIndex != nil || rf.matchIndex != nil {
-		log.Fatalf("Unable to determine Raft state for raft %v, nextIndex: %v, matchIndex: %v", rf.me,
-			rf.nextIndex, rf.matchIndex)
+	isLeader := false
+	for idx := range rf.peers {
+		isLeader = isLeader && rf.nextIndex[idx] > -1
+		isLeader = isLeader && rf.matchIndex[idx] > -1
 	}
-	return false
+	return isLeader
 }
 
 // func (rf Raft) isFollower() bool {
@@ -124,6 +125,8 @@ func (rf *Raft) isLeader() bool {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	return rf.currentTerm, rf.isLeader()
 }
 
@@ -237,7 +240,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		// Check that the term matches, otherwise drop it from this log and fail
 		log_entry := rf.log[args.PrevLogIndex]
-		if log_entry.term != args.PrevLogTerm {
+		if log_entry.Term != args.PrevLogTerm {
 			rf.updateLog(rf.log[:args.PrevLogIndex])
 			reply.Success = false
 			return
@@ -259,7 +262,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.votedFor = -1
 	// It's a follower now
 	rf.isCandidate = false
-	log.Print("Successfully received heartbeat received from the fearless leader.")
+	log.Printf("Successfully received heartbeat received from AppendEntries for instance %d.", rf.me)
 }
 
 func (rf *Raft) sendAppendEntries(peerIdx int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -304,8 +307,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if validCandidateTerm && noVote && validCandidateLog {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
+	} else {
+		reply.VoteGranted = false
 	}
-	reply.VoteGranted = false
 }
 
 //
@@ -394,7 +398,7 @@ func (rf *Raft) campaign(ctx context.Context) bool {
 	if rf.log == nil {
 		lastLogTerm = 0
 	} else {
-		lastLogTerm = rf.log[len(rf.log)-1].term
+		lastLogTerm = rf.log[len(rf.log)-1].Term
 	}
 	logIdx := len(rf.log)
 	rf.mu.Unlock()
@@ -430,10 +434,10 @@ func (rf *Raft) campaign(ctx context.Context) bool {
 		case <-ctx.Done():
 			// This leads to waiting an extra timeout before campaining resumes, that's against the spec
 			// but I think it should be fine.
-			log.Printf("Raft: %v timed out while campaigning\n", rf.me)
+			log.Printf("Raft: %d timed out while campaigning\n", rf.me)
 			return false
 		case <-rf.heartbeatChan:
-			log.Printf("Raft: %v received valid heartbeat while campaining, switching to follower mode\n", rf.me)
+			log.Printf("Raft: %d received valid heartbeat while campaigning, switching to follower mode\n", rf.me)
 			return false
 		case result := <-resultChan:
 			votesReceived += 1
@@ -471,7 +475,7 @@ func (rf *Raft) ticker() {
 			}
 			cancel()
 		case <-rf.heartbeatChan:
-			log.Println("heartbeat received, I won't be seeking election.")
+			log.Printf("Heartbeat received, I won't be seeking election for instance %d\n", rf.me)
 		}
 	}
 }
@@ -522,7 +526,7 @@ func (rf *Raft) lead() {
 	for !rf.killed() {
 		// For now, just send heartbeats periodically
 		rf.sendAllAppendEntries()
-		time.Sleep(time.Microsecond * 150)
+		time.Sleep(time.Millisecond * 150)
 	}
 }
 
@@ -550,8 +554,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.log = nil
-	rf.nextIndex = nil
-	rf.matchIndex = nil
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	// Values of -1 here are used to indicate that this instance is not a leader
+	for idx := range rf.peers {
+		rf.nextIndex[idx] = -1
+		rf.matchIndex[idx] = -1
+	}
 	// rf.lastApplied = -1
 	// rf.commitIndex = -1
 
