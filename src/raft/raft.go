@@ -68,18 +68,24 @@ type LogEntry struct {
 	Term    int
 }
 
+type HeartbeatData struct {
+	leaderId int
+	newTerm  int
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu            sync.Mutex          // Lock to protect shared access to this peer's state
-	peers         []*labrpc.ClientEnd // RPC end points of all peers
-	persister     *Persister          // Object to hold this peer's persisted state
-	me            int                 // this peer's index into peers[]
-	dead          int32               // set by Kill()
-	isCandidate   bool                // Indicates the state of this worker, along with the contents of nextIndex/matchIndex the state can be
-	heartbeatChan chan struct{}       // Channel to indicate a successful heartbeat
+	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	peers     []*labrpc.ClientEnd // RPC end points of all peers
+	persister *Persister          // Object to hold this peer's persisted state
+	me        int                 // this peer's index into peers[]
+	dead      int32               // set by Kill()
+	// Indicates the state of this worker, along with the contents of nextIndex/matchIndex the state can be
 	// fully determined: candidate, follower, or leader
+	isCandidate   bool
+	heartbeatChan chan HeartbeatData // Channel to indicate a successful heartbeat
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -110,7 +116,7 @@ func (rf *Raft) updateLog(newLog []LogEntry) {
 func (rf *Raft) isLeader() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	isLeader := false
+	isLeader := true
 	for idx := range rf.peers {
 		isLeader = isLeader && rf.nextIndex[idx] > -1
 		isLeader = isLeader && rf.matchIndex[idx] > -1
@@ -126,8 +132,10 @@ func (rf *Raft) isLeader() bool {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return rf.currentTerm, rf.isLeader()
+	currentTerm := rf.currentTerm
+	rf.mu.Unlock()
+	log.Printf("Raft %d state: term %d, leader %t", rf.me, currentTerm, rf.isLeader())
+	return currentTerm, rf.isLeader()
 }
 
 //
@@ -222,15 +230,40 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+// Set this instance's state as a follower, often this is used as the result of a receiving an RPC
+// request with a higher term, that it set here too.
+func (rf *Raft) setFollowerState(newTerm int) {
+	// Set this instance state as a follower
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	reply.Term = rf.currentTerm
+	// Set state to follower
+	rf.currentTerm = newTerm
+	rf.isCandidate = false
+	// These are set to -1 to indicate this node is not a leader
+	rf.setLeaderArraysTo(-1, -1)
+	rf.votedFor = -1
+	rf.isCandidate = false
+	// Persist currentTerm and votedFor
+	rf.persist()
+	log.Printf("Raft %d, term %d, set as follower", rf.me, rf.currentTerm)
+}
 
-	if args.Term < rf.currentTerm {
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	// log.Printf("Raft %d, term %d received append entries request from %d, term %d", rf.me, rf.currentTerm, args.LeaderId, args.Term)
+	reply.Term = rf.currentTerm
+	rf.mu.Unlock()
+	if args.Term < reply.Term {
 		reply.Success = false
 		return
 	}
+	// As long as the args.Term is >= rf.currentTerm, this is a valid heartbeat
+	rf.heartbeatChan <- HeartbeatData{leaderId: args.LeaderId, newTerm: args.Term}
+	// Sucks to call this here, but if this instance is a follower, this is the only place, candidates and leaders
+	// call this in campaign and lead respectively, it may be necessary to call on a follower to reset canditate/voted_for state
+	// Not very well named or modular in that case huh?
+	rf.setFollowerState(args.Term)
+	defer log.Printf("Raft %d returning from appendEntries to leader %d, %v", rf.me, args.LeaderId, reply)
 	// At startup the leader won't have a log, and PrevLogIndex == -1
 	if args.PrevLogIndex >= 0 {
 		// Otherwise make sure that this log contains an entry at PrevLogIndex
@@ -256,13 +289,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// Looks good, now append the new entries, TODO
 	reply.Success = true
-	// A successful message from the leader was received, reset heartbeat
-	rf.heartbeatChan <- struct{}{}
-	// After a successful heartbeat, the election is over
-	rf.votedFor = -1
-	// It's a follower now
-	rf.isCandidate = false
-	log.Printf("Successfully received heartbeat received from AppendEntries for instance %d.", rf.me)
 }
 
 func (rf *Raft) sendAppendEntries(peerIdx int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -310,6 +336,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else {
 		reply.VoteGranted = false
 	}
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+	}
+	// Persist the currentTerm and votedFor
+	rf.persist()
+	log.Printf("Raft %d voted for instance %d vote %t, term %d", rf.me, args.CandidateId, reply.VoteGranted, rf.currentTerm)
+	log.Printf("Raft %d vote reason: validCandidateTerm %t, noVote %t, validCandidateLog %t", rf.me, validCandidateTerm, noVote, validCandidateLog)
 }
 
 //
@@ -354,11 +387,10 @@ func (rf *Raft) sendRequestVote(peerIdx int, args *RequestVoteArgs, reply *Reque
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
 
 	// Your code here (2B).
 
-	return index, term, isLeader
+	return index, term, rf.isLeader()
 }
 
 //
@@ -374,6 +406,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
+	log.Printf("Raft %d killed", rf.me)
 	// Your code here, if desired.
 }
 
@@ -392,6 +425,7 @@ func (rf *Raft) campaign(ctx context.Context) bool {
 	resultChan := make(chan bool)
 	rf.mu.Lock()
 	rf.currentTerm += 1
+	rf.votedFor = rf.me
 	rf.persist()
 	currentTerm := rf.currentTerm
 	var lastLogTerm int
@@ -415,29 +449,30 @@ func (rf *Raft) campaign(ctx context.Context) bool {
 				}
 				reply := &RequestVoteReply{}
 				success := rf.sendRequestVote(peerIdx, args, reply)
-				if success && reply.VoteGranted {
-					resultChan <- true
-				} else {
-					resultChan <- false
-				}
+				resultChan <- success && reply.VoteGranted
 			}(resultChan, peerIdx)
 		}
 	}
 
 	// Wait for results to come back in
 	// But only wait until the election timeout is up
-	yesVotes := 0
-	votesReceived := 0
-	voterCount := len(rf.peers) - 1
+	// Or a heartbeat comes in from another leader
+	// This instance votes for itself
+	yesVotes := 1
+	votesReceived := 1
+	voterCount := len(rf.peers)
 	for !rf.killed() {
 		select {
 		case <-ctx.Done():
-			// This leads to waiting an extra timeout before campaining resumes, that's against the spec
+			// This leads to waiting an extra timeout before campaigning resumes, that's against the spec
 			// but I think it should be fine.
-			log.Printf("Raft: %d timed out while campaigning\n", rf.me)
+			log.Printf("Raft %d timed out while campaigning\n", rf.me)
+			rf.setFollowerState(rf.currentTerm)
 			return false
-		case <-rf.heartbeatChan:
-			log.Printf("Raft: %d received valid heartbeat while campaigning, switching to follower mode\n", rf.me)
+		case hbData := <-rf.heartbeatChan:
+			log.Printf("Raft %d received valid heartbeat from leader %d while campaigning, switching to follower mode\n",
+				rf.me, hbData)
+			rf.setFollowerState(hbData.newTerm)
 			return false
 		case result := <-resultChan:
 			votesReceived += 1
@@ -446,12 +481,14 @@ func (rf *Raft) campaign(ctx context.Context) bool {
 			}
 			// Did we reach a majority vote?
 			if yesVotes > voterCount/2 {
+				rf.setFollowerState(rf.currentTerm)
 				return true
 			}
 			// If we got all the votes and still no majority we lost
 			// I guess we don't have to hear from all of them to determine that, but let's
 			// keep it simple
 			if votesReceived == voterCount {
+				rf.setFollowerState(rf.currentTerm)
 				return false
 			}
 		}
@@ -460,35 +497,37 @@ func (rf *Raft) campaign(ctx context.Context) bool {
 	return false
 }
 
-// The ticker go routine starts a new election if this peer hasn't received
+// The ticker goroutine starts a new election if this peer hasn't received
 // heartbeats recently.
 func (rf *Raft) ticker() {
 	for !rf.killed() {
 		select {
 		case <-time.After(getTimeToSleep()):
-			log.Println("Heartbeat not received within timeout, I am excited to announce my candidacy.")
+			log.Printf("Raft %d heartbeat not received within timeout, becoming candidate", rf.me)
 			ctx, cancel := context.WithTimeout(context.Background(), getTimeToSleep())
 			if rf.campaign(ctx) {
-				// Get out of the follower loop, become  leader
+				// Get out of the follower loop, become leader
 				cancel()
 				rf.lead()
 			}
 			cancel()
-		case <-rf.heartbeatChan:
-			log.Printf("Heartbeat received, I won't be seeking election for instance %d\n", rf.me)
+		case hbData := <-rf.heartbeatChan:
+			log.Printf("Raft %d heartbeat received from leader %d, I won't be seeking election.",
+				rf.me, hbData)
 		}
 	}
 }
 
-func (rf *Raft) sendAllAppendEntries() {
+func (rf *Raft) sendAllAppendEntries(failureChan chan int) {
 	rf.mu.Lock()
+	log.Printf("Raft %d sending all append entries, term %d", rf.me, rf.currentTerm)
 	defer rf.mu.Unlock()
 	currentTerm := rf.currentTerm
 	for peerIdx := range rf.peers {
 		if peerIdx == rf.me {
 			continue
 		}
-		go func() {
+		go func(peerIdx int, currentTerm int) {
 			// No locks are needed here, rf.me doesn't change
 			// TODO: update PrevLog... and LeaderCommit once data is really sent
 			args := &AppendEntriesArgs{
@@ -502,10 +541,26 @@ func (rf *Raft) sendAllAppendEntries() {
 			reply := &AppendEntriesReply{}
 			ok := rf.sendAppendEntries(peerIdx, args, reply)
 			if !ok {
-				// TODO, improve this log when entries are being sent
-				log.Printf("AppendEntries to peer %v failed, lowering log idx to ...", peerIdx)
+				log.Printf("Raft %d AppendEntries to peer %d timed out", rf.me, peerIdx)
+			} else if !reply.Success {
+				// TODO, improve this log when entries are really being sent
+				log.Printf("Raft %d AppendEntries to peer %d failed, lowering idx to try again", rf.me, peerIdx)
+				// Check to make sure that the term of the follower isn't higher than this term
+				// That could happen if this instance is an outdated leader, e.g. was cutoff for a while
+				// It indicates that this instance node is no longer the leader
+				if reply.Term > currentTerm {
+					log.Printf("Raft %d failed leadership term %d, new term %d", rf.me, currentTerm, reply.Term)
+					failureChan <- reply.Term
+				}
 			}
-		}()
+		}(peerIdx, currentTerm)
+	}
+}
+
+func (rf *Raft) setLeaderArraysTo(nextIndex int, matchIndex int) {
+	for idx := range rf.peers {
+		rf.nextIndex[idx] = nextIndex
+		rf.matchIndex[idx] = matchIndex
 	}
 }
 
@@ -515,18 +570,33 @@ func (rf *Raft) lead() {
 	// rpc to assert leadership
 	rf.mu.Lock()
 	lastLogIdx := len(rf.log)
-	for idx := range rf.peers {
-		if idx == rf.me {
-			continue
-		}
-		rf.nextIndex[idx] = lastLogIdx + 1
-		rf.matchIndex[idx] = 0
-	}
+	rf.setLeaderArraysTo(lastLogIdx+1, 0)
 	rf.mu.Unlock()
+
+	log.Printf("Raft %d is leader now", rf.me)
+	// Channel to indicate another leader has taken over, sends the new term number
+	failureChan := make(chan int)
+	// Send initial heartbeat immediately
+	rf.sendAllAppendEntries(failureChan)
 	for !rf.killed() {
-		// For now, just send heartbeats periodically
-		rf.sendAllAppendEntries()
-		time.Sleep(time.Millisecond * 150)
+		select {
+		case <-time.After(time.Millisecond * 150):
+			rf.sendAllAppendEntries(failureChan)
+		case hbData := <-rf.heartbeatChan:
+			// Another leader sent an appendEntries rpc with a higher term
+			// exit this function to resume follower function
+			log.Printf("Raft %d as leader, found a leader with a higher term, leader %d, becoming follower.", rf.me, hbData)
+			rf.setFollowerState(hbData.newTerm)
+			log.Printf("Raft %d, is set to not be leader any more", rf.me)
+			return
+		case newTerm := <-failureChan:
+			// Heard from a follower that this instance is no longer the leader
+			// Transition state back to follower, exit this function to resume follower function
+			log.Printf("Raft %d as leader, found a follower with a higher term %d, becoming follower.", rf.me, newTerm)
+			// These are set to -1 to indicate this node is a follower
+			rf.setFollowerState(newTerm)
+			return
+		}
 	}
 }
 
@@ -550,7 +620,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.isCandidate = false
-	rf.heartbeatChan = make(chan struct{})
+	rf.heartbeatChan = make(chan HeartbeatData)
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.log = nil
@@ -566,7 +636,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
+	log.Printf("Starting ticker for instance %d", me)
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
