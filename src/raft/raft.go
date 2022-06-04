@@ -402,7 +402,7 @@ func (rf *Raft) campaign(ctx context.Context) bool {
 	// Initiate requests to all peers
 	for peerIdx := range rf.peers {
 		if peerIdx != rf.me {
-			go func(resultChan chan bool) {
+			go func(resultChan chan bool, peerIdx int) {
 				args := &RequestVoteArgs{
 					Term:         currentTerm,
 					CandidateId:  rf.me,
@@ -416,7 +416,7 @@ func (rf *Raft) campaign(ctx context.Context) bool {
 				} else {
 					resultChan <- false
 				}
-			}(resultChan)
+			}(resultChan, peerIdx)
 		}
 	}
 
