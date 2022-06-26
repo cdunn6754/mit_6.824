@@ -253,6 +253,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// log.Printf("Raft %d, term %d received append entries request from %d, term %d", rf.me, rf.currentTerm, args.LeaderId, args.Term)
 	reply.Term = rf.currentTerm
 	rf.mu.Unlock()
+	defer log.Printf("Raft %d returning from appendEntries to leader %d, %v", rf.me, args.LeaderId, reply)
 	if args.Term < reply.Term {
 		reply.Success = false
 		return
@@ -260,10 +261,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// As long as the args.Term is >= rf.currentTerm, this is a valid heartbeat
 	rf.heartbeatChan <- HeartbeatData{leaderId: args.LeaderId, newTerm: args.Term}
 	// Sucks to call this here, but if this instance is a follower, this is the only place, candidates and leaders
-	// call this in campaign and lead respectively, it may be necessary to call on a follower to reset canditate/voted_for state
+	// call this in campaign and lead respectively, it may be necessary to call on a follower to reset candidate/voted_for/term state
 	// Not very well named or modular in that case huh?
 	rf.setFollowerState(args.Term)
-	defer log.Printf("Raft %d returning from appendEntries to leader %d, %v", rf.me, args.LeaderId, reply)
 	// At startup the leader won't have a log, and PrevLogIndex == -1
 	if args.PrevLogIndex >= 0 {
 		// Otherwise make sure that this log contains an entry at PrevLogIndex
@@ -512,23 +512,23 @@ func (rf *Raft) ticker() {
 			}
 			cancel()
 		case hbData := <-rf.heartbeatChan:
-			log.Printf("Raft %d heartbeat received from leader %d, I won't be seeking election.",
-				rf.me, hbData)
+			log.Printf("Raft %d heartbeat received from leader %v, I won't be seeking election.", rf.me, hbData)
 		}
 	}
 }
 
-func (rf *Raft) sendAllAppendEntries(failureChan chan int) {
+func (rf *Raft) sendAllAppendEntries(failureChan chan int, ctx context.Context) {
 	rf.mu.Lock()
 	log.Printf("Raft %d sending all append entries, term %d", rf.me, rf.currentTerm)
-	defer rf.mu.Unlock()
+	rf.mu.Unlock()
 	currentTerm := rf.currentTerm
+	// No locks are needed here, rf.me and peers don't change
 	for peerIdx := range rf.peers {
 		if peerIdx == rf.me {
 			continue
 		}
 		go func(peerIdx int, currentTerm int) {
-			// No locks are needed here, rf.me doesn't change
+
 			// TODO: update PrevLog... and LeaderCommit once data is really sent
 			args := &AppendEntriesArgs{
 				Term:         currentTerm,
@@ -539,19 +539,28 @@ func (rf *Raft) sendAllAppendEntries(failureChan chan int) {
 				LeaderCommit: -1,
 			}
 			reply := &AppendEntriesReply{}
-			ok := rf.sendAppendEntries(peerIdx, args, reply)
-			if !ok {
-				log.Printf("Raft %d AppendEntries to peer %d timed out", rf.me, peerIdx)
-			} else if !reply.Success {
-				// TODO, improve this log when entries are really being sent
-				log.Printf("Raft %d AppendEntries to peer %d failed, lowering idx to try again", rf.me, peerIdx)
-				// Check to make sure that the term of the follower isn't higher than this term
-				// That could happen if this instance is an outdated leader, e.g. was cutoff for a while
-				// It indicates that this instance node is no longer the leader
-				if reply.Term > currentTerm {
-					log.Printf("Raft %d failed leadership term %d, new term %d", rf.me, currentTerm, reply.Term)
-					failureChan <- reply.Term
+			resChan := make(chan bool)
+			go func() { resChan <- rf.sendAppendEntries(peerIdx, args, reply) }()
+			select {
+			case ok := <-resChan:
+				if !ok {
+					log.Printf("Raft %d AppendEntries to peer %d RPC problem", rf.me, peerIdx)
+				} else if !reply.Success {
+					// Check to make sure that the term of the follower isn't higher than this term
+					// That could happen if this instance is an outdated leader, e.g. was cutoff for a while
+					// It indicates that this instance node is no longer the leader
+					if reply.Term > currentTerm {
+						log.Printf("Raft %d AppendEntries to peer %d shows failed leadership term %d, new term %d",
+							rf.me, peerIdx, currentTerm, reply.Term)
+						failureChan <- reply.Term
+					} else {
+						// TODO, improve this log when entries are really being sent
+						log.Printf("Raft %d AppendEntries to peer %d failed, lowering idx to try again", rf.me, peerIdx)
+					}
+
 				}
+			case <-ctx.Done():
+				log.Printf("Raft %d canceling appendEntry request for peer %d", rf.me, peerIdx)
 			}
 		}(peerIdx, currentTerm)
 	}
@@ -577,12 +586,15 @@ func (rf *Raft) lead() {
 	// Channel to indicate another leader has taken over, sends the new term number
 	failureChan := make(chan int)
 	// Send initial heartbeat immediately
-	rf.sendAllAppendEntries(failureChan)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rf.sendAllAppendEntries(failureChan, ctx)
 	for !rf.killed() {
 		select {
 		case <-time.After(time.Millisecond * 150):
-			rf.sendAllAppendEntries(failureChan)
+			rf.sendAllAppendEntries(failureChan, ctx)
 		case hbData := <-rf.heartbeatChan:
+			cancel()
 			// Another leader sent an appendEntries rpc with a higher term
 			// exit this function to resume follower function
 			log.Printf("Raft %d as leader, found a leader with a higher term, leader %d, becoming follower.", rf.me, hbData)
@@ -590,6 +602,7 @@ func (rf *Raft) lead() {
 			log.Printf("Raft %d, is set to not be leader any more", rf.me)
 			return
 		case newTerm := <-failureChan:
+			cancel()
 			// Heard from a follower that this instance is no longer the leader
 			// Transition state back to follower, exit this function to resume follower function
 			log.Printf("Raft %d as leader, found a follower with a higher term %d, becoming follower.", rf.me, newTerm)
