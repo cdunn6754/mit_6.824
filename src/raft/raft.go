@@ -73,6 +73,11 @@ type HeartbeatData struct {
 	newTerm  int
 }
 
+type NewTermData struct {
+	term     int
+	leaderId int
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -85,7 +90,8 @@ type Raft struct {
 	// Indicates the state of this worker, along with the contents of nextIndex/matchIndex the state can be
 	// fully determined: candidate, follower, or leader
 	isCandidate   bool
-	heartbeatChan chan HeartbeatData // Channel to indicate a successful heartbeat
+	heartbeatChan chan HeartbeatData // Channel to indicate a successful heartbeat from an appendEntry
+	newTermChan   chan NewTermData   //
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -124,9 +130,9 @@ func (rf *Raft) isLeader() bool {
 	return isLeader
 }
 
-// func (rf Raft) isFollower() bool {
-// 	return !rf.isLeader() && !rf.isCandidate
-// }
+func (rf Raft) isFollower() bool {
+	return !rf.isLeader() && !rf.isCandidate
+}
 
 // return currentTerm and whether this server
 // believes it is the leader.
@@ -317,11 +323,13 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-//
-// example RequestVote RPC handler.
-//
+// RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	// If the args.Term exceeds rf term, then increase rf term and set as a follower
+	if args.Term > rf.currentTerm {
+		rf.setFollowerState(args.Term)
+	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
@@ -436,7 +444,7 @@ func (rf *Raft) campaign(ctx context.Context) bool {
 	}
 	logIdx := len(rf.log)
 	rf.mu.Unlock()
-	// This should all be threadsafe, we don't change rf.peers, or rf.me
+	// This should all be thread-safe, we don't change rf.peers, or rf.me
 	// Initiate requests to all peers
 	for peerIdx := range rf.peers {
 		if peerIdx != rf.me {
@@ -467,7 +475,7 @@ func (rf *Raft) campaign(ctx context.Context) bool {
 			// This leads to waiting an extra timeout before campaigning resumes, that's against the spec
 			// but I think it should be fine.
 			log.Printf("Raft %d timed out while campaigning\n", rf.me)
-			rf.setFollowerState(rf.currentTerm)
+			rf.setFollowerState(rf.currentTerm + 1)
 			return false
 		case hbData := <-rf.heartbeatChan:
 			log.Printf("Raft %d received valid heartbeat from leader %d while campaigning, switching to follower mode\n",
@@ -501,19 +509,50 @@ func (rf *Raft) campaign(ctx context.Context) bool {
 // heartbeats recently.
 func (rf *Raft) ticker() {
 	for !rf.killed() {
+		ctx, cancel := context.WithTimeout(context.Background(), getTimeToSleep())
 		select {
 		case <-time.After(getTimeToSleep()):
 			log.Printf("Raft %d heartbeat not received within timeout, becoming candidate", rf.me)
-			ctx, cancel := context.WithTimeout(context.Background(), getTimeToSleep())
 			if rf.campaign(ctx) {
-				// Get out of the follower loop, become leader
-				cancel()
-				rf.lead()
+				rf.lead(ctx)
 			}
-			cancel()
+
 		case hbData := <-rf.heartbeatChan:
 			log.Printf("Raft %d heartbeat received from leader %v, I won't be seeking election.", rf.me, hbData)
+			break
 		}
+		cancel()
+	}
+
+	// Worker functions call doneChan with {} after they have completed, it is a way to signal to ticker
+	// that they are releasing control. E.g. when a candidate finishes the election, it should set the raft state
+	// appropriately depending on the outcome of the election, and then write to doneChan.
+	doneChan := make(chan struct{})
+	// Worker functions listen to finishChan in a non-blocking way, it provides a way for ticker to preempt their control.
+	// E.g. when a leader receives on the finishChan, it should set its state to follower and return.
+	// A context with cancel could perform a similar function, but it would need to be recreated multiple times.
+	finishChan := make(chan struct{})
+	for !rf.killed() {
+		select {
+		case hbData := <-rf.heartbeatChan:
+			log.Printf("Raft %d heartbeat received from leader %v, I won't be seeking election.", rf.me, hbData)
+			finishChan <- struct{}{}
+		case <-doneChan:
+			switch {
+			case rf.isLeader():
+				log.Printf("Raft %d starting as a leader")
+				go rf.lead(doneChan, finishChan)
+			case rf.isCandidate:
+				rf.mu.Lock()
+				log.Printf("Raft %d starting a new campaign, term %d", rf.me, rf.currentTerm)
+				rf.mu.Unlock()
+				go rf.campaign(doneChan, finishChan)
+			default:
+				// Follow
+			}
+
+		}
+
 	}
 }
 
@@ -528,7 +567,6 @@ func (rf *Raft) sendAllAppendEntries(failureChan chan int, ctx context.Context) 
 			continue
 		}
 		go func(peerIdx int, currentTerm int) {
-
 			// TODO: update PrevLog... and LeaderCommit once data is really sent
 			args := &AppendEntriesArgs{
 				Term:         currentTerm,
@@ -597,7 +635,8 @@ func (rf *Raft) lead() {
 			cancel()
 			// Another leader sent an appendEntries rpc with a higher term
 			// exit this function to resume follower function
-			log.Printf("Raft %d as leader, found a leader with a higher term, leader %d, becoming follower.", rf.me, hbData)
+			log.Printf("Raft %d as leader, received a heartbeat from leader with a higher term: %d, now becoming follower.",
+				rf.me, hbData)
 			rf.setFollowerState(hbData.newTerm)
 			log.Printf("Raft %d, is set to not be leader any more", rf.me)
 			return
