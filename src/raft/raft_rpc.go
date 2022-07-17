@@ -30,10 +30,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// As long as the args.Term is >= rf.currentTerm, this is a valid heartbeat
 	rf.heartbeatChan <- HeartbeatData{leaderId: args.LeaderId, newTerm: args.Term}
-	// Sucks to call this here, but if this instance is a follower, this is the only place, candidates and leaders
-	// call this in campaign and lead respectively, it may be necessary to call on a follower to reset candidate/voted_for/term state
-	// Not very well named or modular in that case huh?
-	rf.setFollowerState(args.Term)
 	// At startup the leader won't have a log, and PrevLogIndex == -1
 	if args.PrevLogIndex >= 0 {
 		// Otherwise make sure that this log contains an entry at PrevLogIndex
@@ -140,7 +136,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// If the args.Term exceeds rf term, then increase rf term and set as a follower
 	if args.Term > rf.currentTerm {
-		rf.setFollowerState(args.Term)
+		rf.stateChangeChan <- StateChangeData{newTerm: args.Term, newState: Follower}
 	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
