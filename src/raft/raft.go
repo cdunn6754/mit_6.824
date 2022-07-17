@@ -460,7 +460,26 @@ func (rf *Raft) lead(doneChan chan<- struct{}, finishChan <-chan struct{}) {
 // A heartbeat may lead to a state change depending on the current state. Determine that here and
 // initiate the state change if necessary.
 func (rf *Raft) heartbeatHandler() {
+	for !rf.killed() {
+		hbData := <-rf.heartbeatChan
+		rf.mu.Lock()
+		currentTerm := rf.currentTerm
+		rf.mu.Unlock()
+		// AppendEntries logic prevents heartbeats if the hbData.newTerm < currentTerm
+		if hbData.newTerm < currentTerm {
+			log.Panicf("Raft %+v in term %d received a heartbeat from leader instance %d in term %d",
+				rf, currentTerm, hbData.leaderId, hbData.newTerm)
+		}
 
+		if rf.isLeader() && hbData.newTerm == currentTerm {
+			// There is a problem if two leaders were elected for the same term
+			log.Panicf("Raft %d as leader in term %d received a heartbeat from leader instance %d in term %d",
+				rf.me, currentTerm, hbData.leaderId, hbData.newTerm)
+		}
+		// Otherwise a heartbeat is expected, leaders and candidates should become followers, and followers
+		// should start a new follower session to reset the heartbeat timeout
+		rf.stateChangeChan <- StateChangeData{newTerm: hbData.newTerm, newState: Follower}
+	}
 }
 
 // Given a desired new state, transition the instance to that state
@@ -559,7 +578,6 @@ func (rf *Raft) ticker() {
 		// 		}
 		// 	}
 		case stateChangeData := <-rf.stateChangeChan:
-			// Logic in AppendEntries => hbData.newTerm >= rf.currentTerm
 			rf.mu.Lock()
 			currentTerm := rf.currentTerm
 			rf.mu.Unlock()
@@ -581,7 +599,7 @@ func (rf *Raft) ticker() {
 			switch {
 			case rf.isLeader():
 				log.Printf("Raft %d starting as a leader", rf.me)
-				// go rf.lead(doneChan, finishChan)
+				go rf.lead(doneChan, finishChan)
 			case rf.isCandidate():
 				log.Printf("Raft %d starting a new campaign, term %d", rf.me, term)
 				go rf.campaign(doneChan, finishChan)
@@ -630,6 +648,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	log.Printf("Starting ticker for instance %d", me)
+	// start the heartbeat handler goroutine that translates heartbeats into state changes
+	go rf.heartbeatHandler()
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
