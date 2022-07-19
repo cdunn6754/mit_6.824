@@ -136,7 +136,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// If the args.Term exceeds rf term, then increase rf term and set as a follower
 	if args.Term > rf.currentTerm {
-		rf.stateChangeChan <- StateChangeData{newTerm: args.Term, newState: Follower}
+		rf.newTermChan <- args.Term
 	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()

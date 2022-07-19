@@ -73,11 +73,6 @@ type HeartbeatData struct {
 	newTerm  int
 }
 
-type NewTermData struct {
-	term     int
-	leaderId int
-}
-
 type StateChangeData struct {
 	newTerm  int
 	newState RaftState
@@ -96,6 +91,7 @@ type Raft struct {
 	// fully determined: candidate, follower, or leader
 	_isCandidate  bool
 	heartbeatChan chan HeartbeatData // Channel to indicate a successful heartbeat from an appendEntry
+	newTermChan   chan int           // Channel that rpc functions can use to interrupt when they get a higher term in a request
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -363,6 +359,7 @@ func (rf *Raft) campaign() {
 	yesVotes := 1
 	votesReceived := 1
 	voterCount := len(rf.peers)
+	timeoutChan := time.After(getTimeToSleep())
 	for !rf.killed() {
 		select {
 		case hb := <-rf.heartbeatChan:
@@ -370,15 +367,16 @@ func (rf *Raft) campaign() {
 			log.Printf("Raft %d while campaigning, received a heartbeat from raft %d", rf.me, hb.leaderId)
 			rf.handleStateChange(StateChangeData{newTerm: hb.newTerm, newState: Follower})
 			return
-		case <-time.After(getTimeToSleep()):
+		case newTerm := <-rf.newTermChan:
+			// A RequestVote RPC came in with a higher term. Revert to follower in new term
+			log.Printf("Raft %d while campaigning, received a higher term rpc for term %d", rf.me, newTerm)
+			rf.handleStateChange(StateChangeData{newTerm: newTerm, newState: Follower})
+		case <-timeoutChan:
 			log.Printf("Raft %d timed out while campaigning in term %d", rf.me, currentTerm)
 			rf.handleStateChange(StateChangeData{newTerm: currentTerm + 1, newState: Candidate})
 			// TODO: use a context to cancel requests here and for heartbeat
 			return
-		case result, ok := <-resultChan:
-			if !ok {
-				continue
-			}
+		case result := <-resultChan:
 			votesReceived += 1
 			if result {
 				yesVotes += 1
@@ -407,11 +405,6 @@ func (rf *Raft) follow() {
 		currentTerm := rf.currentTerm
 		rf.mu.Unlock()
 		select {
-		// case <-finishChan:
-		// 	// Nothing to do. This instance received a heartbeat before timeout. Stop, this function will
-		// 	// be called again soon by ticker.
-		// 	doneChan <- struct{}{}
-		// 	return
 		case <-time.After(getTimeToSleep()):
 			// Switch to candidate, we timed out waiting
 			log.Printf("Raft %d timed out following, becoming a candidate", rf.me)
@@ -421,15 +414,17 @@ func (rf *Raft) follow() {
 			// Got a valid heartbeat
 			// If the term has increased, restart this function with a new term
 			if currentTerm < hb.newTerm {
-				log.Printf("Raft %d as follower is incrementing its term to %d", rf.me, hb.newTerm)
+				log.Printf("Raft %d as follower is increasing its term to %d due to a heartbeat", rf.me, hb.newTerm)
 				rf.handleStateChange(StateChangeData{newState: Candidate, newTerm: hb.newTerm})
 				return
 			}
-			// Otherwise, continue following the current leader in this term
-			continue
+		case newTerm := <-rf.newTermChan:
+			// An RPC received a request from another instance with a higher term
+			log.Printf("Raft %d as follower is increasing its term to %d", rf.me, newTerm)
+			rf.handleStateChange(StateChangeData{newState: Candidate, newTerm: newTerm})
+			return
 		}
 	}
-
 }
 
 func (rf *Raft) setLeaderArraysTo(nextIndex int, matchIndex int) {
@@ -468,7 +463,7 @@ func (rf *Raft) lead() {
 				log.Panicf("Raft %d as leader in term %d received a heartbeat from leader instance %d in term %d",
 					rf.me, currentTerm, hb.leaderId, hb.newTerm)
 			}
-			log.Printf("Raft %d as leader, received a heartbeat from leader with a greater term: greater, now becoming follower.",
+			log.Printf("Raft %d as leader, received a heartbeat from leader with a greater term: %+v, now becoming follower.",
 				rf.me, hb)
 			rf.handleStateChange(StateChangeData{newTerm: hb.newTerm, newState: Follower})
 			return
@@ -476,6 +471,12 @@ func (rf *Raft) lead() {
 			// Heard from a follower that this instance is no longer the leader
 			// Transition state back to follower, exit this function to resume follower function
 			log.Printf("Raft %d as leader, found a follower with a higher term %d", rf.me, newTerm)
+			rf.handleStateChange(StateChangeData{newTerm: newTerm, newState: Follower})
+			return
+		case newTerm := <-rf.newTermChan:
+			// Heard from a candidate with a higher term.
+			// Transition state back to follower, exit this function to resume follower function, in the higher term
+			log.Printf("Raft %d as leader, found a candidate with a higher term %d", rf.me, newTerm)
 			rf.handleStateChange(StateChangeData{newTerm: newTerm, newState: Follower})
 			return
 		}
