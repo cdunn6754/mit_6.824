@@ -3,6 +3,7 @@ package raft
 import (
 	"context"
 	"log"
+	"sync"
 )
 
 type AppendEntriesArgs struct {
@@ -88,7 +89,7 @@ func (rf *Raft) sendAllAppendEntries(failureChan chan int, ctx context.Context) 
 			select {
 			case ok := <-resChan:
 				if !ok {
-					log.Printf("Raft %d AppendEntries to peer %d RPC problem", rf.me, peerIdx)
+					log.Printf("Raft %d AppendEntries to peer %d RPC network problem", rf.me, peerIdx)
 				} else if !reply.Success {
 					// Check to make sure that the term of the follower isn't higher than this term
 					// That could happen if this instance is an outdated leader, e.g. was cutoff for a while
@@ -135,9 +136,16 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// If the args.Term exceeds rf term, then increase rf term and set as a follower
-	if args.Term > rf.currentTerm {
-		rf.newTermChan <- args.Term
+	rf.mu.Lock()
+	currentTerm := rf.currentTerm
+	rf.mu.Unlock()
+	wg := &sync.WaitGroup{}
+	if args.Term > currentTerm {
+		wg.Add(1)
+		data := NewTermData{term: args.Term, wg: wg}
+		rf.newTermChan <- data
 	}
+	wg.Wait()
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
@@ -149,16 +157,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if validCandidateTerm && noVote && validCandidateLog {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
+		// Persist votedFor
+		rf.persist()
 	} else {
 		reply.VoteGranted = false
 	}
-	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-	}
-	// Persist the currentTerm and votedFor
-	rf.persist()
-	log.Printf("Raft %d voted for instance %d vote %t, term %d", rf.me, args.CandidateId, reply.VoteGranted, rf.currentTerm)
-	log.Printf("Raft %d vote reason: validCandidateTerm %t, noVote %t, validCandidateLog %t", rf.me, validCandidateTerm, noVote, validCandidateLog)
+	log.Printf("Raft %d voted for instance %d vote %t, term %d",
+		rf.me, args.CandidateId, reply.VoteGranted, rf.currentTerm)
+	log.Printf("Raft %d vote reason: validCandidateTerm %t, noVote %t, validCandidateLog %t",
+		rf.me, validCandidateTerm, noVote, validCandidateLog)
 }
 
 //

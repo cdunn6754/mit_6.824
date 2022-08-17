@@ -73,6 +73,16 @@ type HeartbeatData struct {
 	newTerm  int
 }
 
+// A WaitGroup is necessary for the calls from the async RPC handlers, e.g.
+// if a  RequestVote request comes with a higher term, then that handler kicks off
+// a state change via the newTerm channel, but it needs to wait for that state change
+// to be completed before it can decide on its vote and formulate a response. This is because its rf.votedFor will
+// be reset by the state change.
+type NewTermData struct {
+	term int
+	wg   *sync.WaitGroup
+}
+
 type StateChangeData struct {
 	newTerm  int
 	newState RaftState
@@ -91,7 +101,7 @@ type Raft struct {
 	// fully determined: candidate, follower, or leader
 	_isCandidate  bool
 	heartbeatChan chan HeartbeatData // Channel to indicate a successful heartbeat from an appendEntry
-	newTermChan   chan int           // Channel that rpc functions can use to interrupt when they get a higher term in a request
+	newTermChan   chan NewTermData   // Channel that rpc functions can use to interrupt when they get a higher term in a request
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -251,7 +261,6 @@ func (rf *Raft) setFollowerState(newTerm int) {
 	defer rf.mu.Unlock()
 	// Set state to follower
 	rf.currentTerm = newTerm
-	rf._isCandidate = false
 	// These are set to -1 to indicate this node is not a leader
 	rf.setLeaderArraysTo(-1, -1)
 	rf.votedFor = -1
@@ -365,15 +374,15 @@ func (rf *Raft) campaign() {
 		case hb := <-rf.heartbeatChan:
 			// Got a valid heartbeat, revert to follower, matching the leaders term
 			log.Printf("Raft %d while campaigning, received a heartbeat from raft %d", rf.me, hb.leaderId)
-			rf.handleStateChange(StateChangeData{newTerm: hb.newTerm, newState: Follower})
+			rf.handleStateChange(StateChangeData{newTerm: hb.newTerm, newState: Follower}, nil)
 			return
-		case newTerm := <-rf.newTermChan:
+		case newTermData := <-rf.newTermChan:
 			// A RequestVote RPC came in with a higher term. Revert to follower in new term
-			log.Printf("Raft %d while campaigning, received a higher term rpc for term %d", rf.me, newTerm)
-			rf.handleStateChange(StateChangeData{newTerm: newTerm, newState: Follower})
+			log.Printf("Raft %d while campaigning, received a higher term rpc for term %d", rf.me, newTermData.term)
+			rf.handleStateChange(StateChangeData{newTerm: newTermData.term, newState: Follower}, newTermData.wg)
 		case <-timeoutChan:
 			log.Printf("Raft %d timed out while campaigning in term %d", rf.me, currentTerm)
-			rf.handleStateChange(StateChangeData{newTerm: currentTerm + 1, newState: Candidate})
+			rf.handleStateChange(StateChangeData{newTerm: currentTerm + 1, newState: Candidate}, nil)
 			// TODO: use a context to cancel requests here and for heartbeat
 			return
 		case result := <-resultChan:
@@ -384,7 +393,7 @@ func (rf *Raft) campaign() {
 			// Did we reach a majority vote?
 			if yesVotes > voterCount/2 {
 				log.Printf("Raft %d won the election in term %d", rf.me, currentTerm)
-				rf.handleStateChange(StateChangeData{newTerm: currentTerm, newState: Leader})
+				rf.handleStateChange(StateChangeData{newTerm: currentTerm, newState: Leader}, nil)
 				return
 			}
 			// If we got all the votes and still no majority we lost
@@ -392,7 +401,7 @@ func (rf *Raft) campaign() {
 			// keep it simple
 			if votesReceived == voterCount {
 				log.Printf("Raft %d while campaigning failed to win in term %d", rf.me, currentTerm)
-				rf.handleStateChange(StateChangeData{newTerm: currentTerm + 1, newState: Candidate})
+				rf.handleStateChange(StateChangeData{newTerm: currentTerm + 1, newState: Candidate}, nil)
 				return
 			}
 		}
@@ -400,28 +409,28 @@ func (rf *Raft) campaign() {
 }
 
 func (rf *Raft) follow() {
+	rf.mu.Lock()
+	currentTerm := rf.currentTerm
+	rf.mu.Unlock()
 	for !rf.killed() {
-		rf.mu.Lock()
-		currentTerm := rf.currentTerm
-		rf.mu.Unlock()
 		select {
 		case <-time.After(getTimeToSleep()):
 			// Switch to candidate, we timed out waiting
 			log.Printf("Raft %d timed out following, becoming a candidate", rf.me)
-			rf.handleStateChange(StateChangeData{newState: Candidate, newTerm: currentTerm + 1})
+			rf.handleStateChange(StateChangeData{newState: Candidate, newTerm: currentTerm + 1}, nil)
 			return
 		case hb := <-rf.heartbeatChan:
 			// Got a valid heartbeat
-			// If the term has increased, restart this function with a new term
 			if currentTerm < hb.newTerm {
+				// If the term has increased, restart this function with a new term
 				log.Printf("Raft %d as follower is increasing its term to %d due to a heartbeat", rf.me, hb.newTerm)
-				rf.handleStateChange(StateChangeData{newState: Candidate, newTerm: hb.newTerm})
+				rf.handleStateChange(StateChangeData{newState: Follower, newTerm: hb.newTerm}, nil)
 				return
 			}
-		case newTerm := <-rf.newTermChan:
-			// An RPC received a request from another instance with a higher term
-			log.Printf("Raft %d as follower is increasing its term to %d", rf.me, newTerm)
-			rf.handleStateChange(StateChangeData{newState: Candidate, newTerm: newTerm})
+		case newTermData := <-rf.newTermChan:
+			// An RPC handler received a request from another instance with a higher term
+			log.Printf("Raft %d as follower is increasing its term to %d", rf.me, newTermData.term)
+			rf.handleStateChange(StateChangeData{newState: Follower, newTerm: newTermData.term}, newTermData.wg)
 			return
 		}
 	}
@@ -465,47 +474,30 @@ func (rf *Raft) lead() {
 			}
 			log.Printf("Raft %d as leader, received a heartbeat from leader with a greater term: %+v, now becoming follower.",
 				rf.me, hb)
-			rf.handleStateChange(StateChangeData{newTerm: hb.newTerm, newState: Follower})
+			rf.handleStateChange(StateChangeData{newTerm: hb.newTerm, newState: Follower}, nil)
 			return
 		case newTerm := <-failureChan:
 			// Heard from a follower that this instance is no longer the leader
 			// Transition state back to follower, exit this function to resume follower function
 			log.Printf("Raft %d as leader, found a follower with a higher term %d", rf.me, newTerm)
-			rf.handleStateChange(StateChangeData{newTerm: newTerm, newState: Follower})
+			rf.handleStateChange(StateChangeData{newTerm: newTerm, newState: Follower}, nil)
 			return
-		case newTerm := <-rf.newTermChan:
+		case newTermData := <-rf.newTermChan:
 			// Heard from a candidate with a higher term.
 			// Transition state back to follower, exit this function to resume follower function, in the higher term
-			log.Printf("Raft %d as leader, found a candidate with a higher term %d", rf.me, newTerm)
-			rf.handleStateChange(StateChangeData{newTerm: newTerm, newState: Follower})
+			log.Printf("Raft %d as leader, found a candidate with a higher term %d", rf.me, newTermData.term)
+			rf.handleStateChange(StateChangeData{newTerm: newTermData.term, newState: Follower}, newTermData.wg)
 			return
 		}
 	}
 }
 
-// // A heartbeat may lead to a state change depending on the current state. Determine that here and
-// // initiate the state change if necessary.
-// func (rf *Raft) heartbeatHandler() {
-// 	for !rf.killed() {
-// 		hbData := <-rf.heartbeatChan
-// 		rf.mu.Lock()
-// 		currentTerm := rf.currentTerm
-// 		rf.mu.Unlock()
-// 		// AppendEntries logic prevents heartbeats if the hbData.newTerm < currentTerm
-// 		if hbData.newTerm < currentTerm {
-// 			log.Panicf("Raft %+v in term %d received a heartbeat from leader instance %d in term %d",
-// 				rf, currentTerm, hbData.leaderId, hbData.newTerm)
-// 		}
-
-// 		if rf.isLeader() &&
-// 		// Otherwise a heartbeat is expected, leaders and candidates should become followers, and followers
-// 		// should start a new follower session to reset the heartbeat timeout
-// 		rf.stateChangeChan <- StateChangeData{newTerm: hbData.newTerm, newState: Follower}
-// 	}
-// }
-
 // Given a desired new state, transition the instance to that state
-func (rf *Raft) handleStateChange(stateChangeData StateChangeData) {
+func (rf *Raft) handleStateChange(stateChangeData StateChangeData, wg *sync.WaitGroup) {
+	if wg != nil {
+		defer wg.Done()
+	}
+
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
 	rf.mu.Unlock()
@@ -563,33 +555,7 @@ func (rf *Raft) handleStateChange(stateChangeData StateChangeData) {
 }
 
 func (rf *Raft) ticker() {
-	// Worker functions call doneChan with {} after they have completed, it is a way to signal to ticker
-	// that they are releasing control. E.g. when a candidate finishes the election, it should set the raft state
-	// appropriately depending on the outcome of the election, and then write to doneChan. This provides
-	// a method to ensure that only a single goroutine is running lead, follow, or campaign at a time.
-	// doneChan := make(chan struct{})
-	// Worker functions listen to finishChan in a non-blocking way, it provides a way for ticker to interrupt.
-	// E.g. when a leader receives on the finishChan, it should send to the doneChan, and then return immediately.
-	// A context with cancel could perform a similar function, but it would need to be recreated multiple times.
-	// finishChan := make(chan struct{})
 	for !rf.killed() {
-		// select {
-		// case stateChangeData := <-rf.stateChangeChan:
-		// 	rf.mu.Lock()
-		// 	currentTerm := rf.currentTerm
-		// 	rf.mu.Unlock()
-		// 	log.Printf("Raft %d changing state from %v in term %d with new state data: %+v", rf.me, rf.getState(),
-		// 		currentTerm, stateChangeData)
-
-		// 	// Whatever state we are in, a send on this channel implies that the worker goroutine should be
-		// 	// stopped and restarted, even if the state is unchanged. E.g. a candidate timeout leads to a new
-		// 	// candidate worker goroutine. But the worker should still be stopped and restarted. In that case
-		// 	// it's important to do so, so that the term can be increased to the value in stateChangeData (it
-		// 	// will be oldTerm +1).
-		// 	finishChan <- struct{}{}
-		// 	rf.handleStateChange(stateChangeData)
-		// case <-doneChan:
-		// A worker routine is done, start another one based on the current state
 		rf.mu.Lock()
 		term := rf.currentTerm
 		rf.mu.Unlock()
@@ -600,15 +566,15 @@ func (rf *Raft) ticker() {
 		case rf.isCandidate():
 			log.Printf("Raft %d starting a new campaign, term %d", rf.me, term)
 			rf.campaign()
-		default:
+		case rf.isFollower():
 			log.Printf("Raft %d starting follow sequence, term %d", rf.me, term)
 			rf.follow()
+		default:
+			log.Panicf("Raft %d invalid state", rf.me)
 		}
 	}
-	// }
 }
 
-//
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -629,6 +595,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf._isCandidate = false
 	rf.heartbeatChan = make(chan HeartbeatData)
+	rf.newTermChan = make(chan NewTermData)
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.log = nil
@@ -644,7 +611,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-	log.Printf("Starting ticker for instance %d", me)
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
