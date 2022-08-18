@@ -51,7 +51,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// This is a weird state, to be in. Maybe this should fail instead? But I'm not sure
 		// what the leader would do then.
 		if len(rf.log) > 0 {
-			rf.updateLog(nil)
+			rf.updateLog(make([]LogEntry, 0))
 		}
 	}
 	// Looks good, now append the new entries, TODO

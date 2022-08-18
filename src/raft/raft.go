@@ -164,6 +164,33 @@ func (rf *Raft) getState() RaftState {
 	}
 }
 
+// Set this instance's state as a follower, often this is used as the result of a receiving an RPC
+// request with a higher term, that is set here too. Also reset the voting stats.
+func (rf *Raft) setFollowerState(newTerm int) {
+	// Set this instance state as a follower
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// Set state to follower
+	rf.currentTerm = newTerm
+	// These are set to -1 to indicate this node is not a leader
+	rf.setLeaderArraysTo(-1, -1)
+	rf.votedFor = -1
+	rf._isCandidate = false
+	// Persist currentTerm and votedFor
+	rf.persist()
+	log.Printf("Raft %d, term %d, set as follower", rf.me, rf.currentTerm)
+}
+
+func (rf *Raft) setCandidateState(newTerm int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf._isCandidate = true
+	rf.currentTerm = newTerm
+	rf.votedFor = rf.me
+	rf.persist()
+	log.Printf("Raft %d set to candidate for term %d", rf.me, newTerm)
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -180,15 +207,6 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
-
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.log)
@@ -205,19 +223,6 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
 
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
@@ -253,33 +258,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-// Set this instance's state as a follower, often this is used as the result of a receiving an RPC
-// request with a higher term, that is set here too. Also reset the voting stats.
-func (rf *Raft) setFollowerState(newTerm int) {
-	// Set this instance state as a follower
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	// Set state to follower
-	rf.currentTerm = newTerm
-	// These are set to -1 to indicate this node is not a leader
-	rf.setLeaderArraysTo(-1, -1)
-	rf.votedFor = -1
-	rf._isCandidate = false
-	// Persist currentTerm and votedFor
-	rf.persist()
-	log.Printf("Raft %d, term %d, set as follower", rf.me, rf.currentTerm)
-}
-
-func (rf *Raft) setCandidateState(newTerm int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf._isCandidate = true
-	rf.currentTerm = newTerm
-	rf.votedFor = rf.me
-	rf.persist()
-	log.Printf("Raft %d set to candidate for term %d", rf.me, newTerm)
-}
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -295,11 +273,10 @@ func (rf *Raft) setCandidateState(newTerm int) {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-
-	// Your code here (2B).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	index := len(rf.log) + 1
+	term := rf.currentTerm
 	return index, term, rf.isLeader()
 }
 
@@ -336,7 +313,7 @@ func (rf *Raft) campaign() {
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
 	var lastLogTerm int
-	if rf.log == nil {
+	if len(rf.log) == 0 {
 		lastLogTerm = 0
 	} else {
 		lastLogTerm = rf.log[len(rf.log)-1].Term
@@ -598,7 +575,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.newTermChan = make(chan NewTermData)
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.log = nil
+	rf.log = make([]LogEntry, 0)
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	// Values of -1 here are used to indicate that this instance is not a leader
