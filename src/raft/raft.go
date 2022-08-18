@@ -64,7 +64,7 @@ type Log struct {
 }
 
 type LogEntry struct {
-	Message string
+	Command interface{}
 	Term    int
 }
 
@@ -113,8 +113,8 @@ type Raft struct {
 	currentTerm int
 
 	// Volatile for all servers
-	// commitIndex int
-	// lastApplied int
+	commitIndex int
+	lastApplied int
 
 	// Volatile leader info, both nil for followers and candidates
 	nextIndex  []int
@@ -258,7 +258,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-//
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -277,6 +276,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	defer rf.mu.Unlock()
 	index := len(rf.log) + 1
 	term := rf.currentTerm
+	if rf.isLeader() {
+		// Append entry to the log
+		newEntry := LogEntry{Term: term, Command: command}
+		rf.log = append(rf.log, newEntry)
+		rf.persist()
+		// The lead goroutine will handle disseminating this info to the other instances
+	}
 	return index, term, rf.isLeader()
 }
 
@@ -413,6 +419,7 @@ func (rf *Raft) follow() {
 	}
 }
 
+// Initialize the leader arrays, NextIndex and MatchIndex
 func (rf *Raft) setLeaderArraysTo(nextIndex int, matchIndex int) {
 	for idx := range rf.peers {
 		rf.nextIndex[idx] = nextIndex
@@ -465,6 +472,9 @@ func (rf *Raft) lead() {
 			log.Printf("Raft %d as leader, found a candidate with a higher term %d", rf.me, newTermData.term)
 			rf.handleStateChange(StateChangeData{newTerm: newTermData.term, newState: Follower}, newTermData.wg)
 			return
+		default:
+			// See if any followers are lacking entries, and send appendEntries as necessary
+
 		}
 	}
 }
@@ -583,8 +593,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.nextIndex[idx] = -1
 		rf.matchIndex[idx] = -1
 	}
-	// rf.lastApplied = -1
-	// rf.commitIndex = -1
+	rf.lastApplied = 0
+	rf.commitIndex = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
