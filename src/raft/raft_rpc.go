@@ -151,10 +151,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 
 	// Check on the RAFT algorithm logic here
-	validCandidateTerm := args.Term >= rf.currentTerm
+	// validLog checks election restriction (Sec. 5.4.1 from the paper)
+	validLog := false
+	if args.Term > rf.currentTerm {
+		validLog = true
+	} else if args.Term == rf.currentTerm && args.LastLogIndex >= len(rf.log) {
+		validLog = true
+	}
 	noVote := rf.votedFor == -1 || rf.votedFor == args.CandidateId
-	validCandidateLog := args.LastLogIndex >= len(rf.log)
-	if validCandidateTerm && noVote && validCandidateLog {
+	if validLog && noVote {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 		// Persist votedFor
@@ -164,8 +169,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	log.Printf("Raft %d voted for instance %d vote %t, term %d",
 		rf.me, args.CandidateId, reply.VoteGranted, rf.currentTerm)
-	log.Printf("Raft %d vote reason: validCandidateTerm %t, noVote %t, validCandidateLog %t",
-		rf.me, validCandidateTerm, noVote, validCandidateLog)
+	log.Printf("Raft %d vote reason: validLog %t, noVote %t",
+		rf.me, validLog, noVote)
 }
 
 //
