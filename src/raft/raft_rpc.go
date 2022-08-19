@@ -66,9 +66,8 @@ func (rf *Raft) sendAppendEntries(peerIdx int, args *AppendEntriesArgs, reply *A
 func (rf *Raft) sendAllAppendEntries(failureChan chan int, ctx context.Context) {
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
-	rf.mu.Unlock()
+	defer rf.mu.Unlock()
 	log.Printf("Raft %d sending all append entries, term %d", rf.me, currentTerm)
-	// No locks are needed here, rf.me and peers don't change
 	for peerIdx := range rf.peers {
 		if peerIdx == rf.me {
 			continue
