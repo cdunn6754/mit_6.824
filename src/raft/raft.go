@@ -55,14 +55,6 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
-type LogTerm struct {
-	entries []string
-}
-
-type Log struct {
-	terms []LogTerm
-}
-
 type LogEntry struct {
 	Command interface{}
 	Term    int
@@ -420,10 +412,86 @@ func (rf *Raft) follow() {
 }
 
 // Initialize the leader arrays, NextIndex and MatchIndex
+// This also sets a value for this leader, but, that's fine, just don't use it.
+// I guess we could set the leader value to nil?
 func (rf *Raft) setLeaderArraysTo(nextIndex int, matchIndex int) {
 	for idx := range rf.peers {
 		rf.nextIndex[idx] = nextIndex
 		rf.matchIndex[idx] = matchIndex
+	}
+}
+
+func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.Context) {
+	// TODO: update PrevLog... and LeaderCommit once data is really sent
+	rf.mu.Lock()
+	nextIndex := rf.nextIndex[peerIdx]
+	matchIndex := rf.matchIndex[peerIdx]
+	lastLogIdx := len(rf.log)
+	currentTerm := rf.currentTerm
+	rf.mu.Unlock()
+	args := &AppendEntriesArgs{
+		Term:         currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: len(rf.log) - 1,
+		PrevLogTerm:  currentTerm,
+		Entries:      nil,
+		LeaderCommit: rf.commitIndex,
+	}
+	if len(rf.log) == 0 {
+		// Special case for when the leader log is empty
+		args.PrevLogIndex = 0
+		args.PrevLogTerm = 0
+	}
+	reply := &AppendEntriesReply{}
+	resChan := make(chan bool)
+	// Send an initial heartbeat
+	go func() { resChan <- rf.sendAppendEntries(peerIdx, args, reply) }()
+	for !rf.killed() {
+		select {
+		case ok := <-resChan:
+			if !ok {
+				log.Printf("Raft %d AppendEntries to peer %d RPC network problem", rf.me, peerIdx)
+			} else if !reply.Success {
+				// Check to make sure that the term of the follower isn't higher than this term
+				// That could happen if this instance is an outdated leader, e.g. was cutoff for a while
+				// It indicates that this instance node is no longer the leader
+				if reply.Term > currentTerm {
+					log.Printf("Raft %d AppendEntries to peer %d shows failed leadership term %d, new term %d",
+						rf.me, peerIdx, currentTerm, reply.Term)
+					failureChan <- reply.Term
+				} else {
+					// TODO, improve this log when entries are really being sent
+					log.Printf("Raft %d AppendEntries to peer %d failed, lowering idx to try again", rf.me, peerIdx)
+				}
+
+			}
+		case <-ctx.Done():
+			log.Printf("Raft %d canceling appendEntry request for peer %d", rf.me, peerIdx)
+			return
+		case <-time.After(time.Millisecond * 150):
+			// Send an empty message as a heartbeat
+		default:
+			// If there is an entry to send, send it
+			if lastLogIdx >= nextIndex {
+
+			}
+		}
+	}
+}
+
+// Set up goroutines for each peer that will continuously work to keep follower logs up to date
+func (rf *Raft) commandFollowers(failureChan chan int, ctx context.Context) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// Maps peerIdx -> successChan for each peer
+	// Where a successChan is used to communicate the logIndex of a successful append by that peer
+	// successChans := make(map[int][]chan int, len(rf.peers)-1)
+	for peerIdx := range rf.peers {
+		if peerIdx == rf.me {
+			continue
+		}
+		go rf.appendToFollower(peerIdx, failureChan, ctx)
 	}
 }
 
@@ -444,6 +512,7 @@ func (rf *Raft) lead() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	rf.sendAllAppendEntries(failureChan, ctx)
+	rf.commandFollowers(failureChan, ctx)
 	for !rf.killed() {
 		select {
 		case <-time.After(time.Millisecond * 150):

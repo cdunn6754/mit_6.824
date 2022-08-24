@@ -3,6 +3,7 @@ package raft
 import (
 	"context"
 	"log"
+	"math"
 	"sync"
 )
 
@@ -11,7 +12,7 @@ type AppendEntriesArgs struct {
 	LeaderId     int
 	PrevLogIndex int
 	PrevLogTerm  int
-	Entries      []string
+	Entries      []LogEntry
 	LeaderCommit int
 }
 type AppendEntriesReply struct {
@@ -31,31 +32,52 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// As long as the args.Term is >= rf.currentTerm, this is a valid heartbeat
 	rf.heartbeatChan <- HeartbeatData{leaderId: args.LeaderId, newTerm: args.Term}
-	// At startup the leader won't have a log, and PrevLogIndex == -1
-	if args.PrevLogIndex >= 0 {
+
+	// At startup the leader won't have a log, and PrevLogIndex == 0
+	// Also when the leader is sending the first entry the PrevLogIndex == 0, in either case
+	// don't expect that previous entry to exist in the follower log
+	// The Raft logic uses 1-indexing for the log
+	if args.PrevLogIndex > 0 {
 		// Otherwise make sure that this log contains an entry at PrevLogIndex
-		if args.PrevLogIndex >= len(rf.log) {
+		if args.PrevLogIndex > len(rf.log) {
+			log.Printf("Raft %d can't append entry because it lacks the PrevLogIndex entry at index %d",
+				rf.me, args.PrevLogIndex)
 			reply.Success = false
 			return
 		}
-		// Check that the term matches, otherwise drop it from this log and fail
-		log_entry := rf.log[args.PrevLogIndex]
-		if log_entry.Term != args.PrevLogTerm {
+		// Check that the previous log entry term matches, otherwise drop it from this log and fail
+		logEntry := rf.log[args.PrevLogIndex-1]
+		if logEntry.Term != args.PrevLogTerm {
 			rf.updateLog(rf.log[:args.PrevLogIndex])
+			log.Printf("Raft %d can't append entry because it has a term mismatch with PrevLogTerm %d",
+				rf.me, args.PrevLogTerm)
 			reply.Success = false
 			return
-		}
-	} else {
-		// The leader has an empty log.
-		// If this rf has a log, empty this log too and reply success.
-		// This is a weird state, to be in. Maybe this should fail instead? But I'm not sure
-		// what the leader would do then.
-		if len(rf.log) > 0 {
-			rf.updateLog(make([]LogEntry, 0))
 		}
 	}
-	// Looks good, now append the new entries, TODO
+
+	// Looks good, now append the new entries
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	reply.Success = true
+	if args.Entries == nil || len(args.Entries) == 0 {
+		// Reset the log too, in case there was something in here from a previous term
+		rf.log = make([]LogEntry, 0)
+		return
+	}
+	// For the time being only one log at a time is supported, TODO possibly optimization here
+	if len(args.Entries) > 1 {
+		log.Panic("Sending more than one command at a time is not supported.a")
+	}
+	entry := args.Entries[0]
+
+	// TODO: it might be better to check if this entry already exists here, but this accomplishes getting
+	// rid of unwanted logs and adding the new one simply
+	rf.log = append(rf.log[:args.PrevLogIndex], entry)
+
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.log))))
+	}
 }
 
 func (rf *Raft) sendAppendEntries(peerIdx int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -65,8 +87,8 @@ func (rf *Raft) sendAppendEntries(peerIdx int, args *AppendEntriesArgs, reply *A
 
 func (rf *Raft) sendAllAppendEntries(failureChan chan int, ctx context.Context) {
 	rf.mu.Lock()
-	currentTerm := rf.currentTerm
 	defer rf.mu.Unlock()
+	currentTerm := rf.currentTerm
 	log.Printf("Raft %d sending all append entries, term %d", rf.me, currentTerm)
 	for peerIdx := range rf.peers {
 		if peerIdx == rf.me {
@@ -105,6 +127,7 @@ func (rf *Raft) sendAllAppendEntries(failureChan chan int, ctx context.Context) 
 				}
 			case <-ctx.Done():
 				log.Printf("Raft %d canceling appendEntry request for peer %d", rf.me, peerIdx)
+				return
 			}
 		}(peerIdx, currentTerm)
 	}
