@@ -422,33 +422,96 @@ func (rf *Raft) setLeaderArraysTo(nextIndex int, matchIndex int) {
 }
 
 func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.Context) {
-	// TODO: update PrevLog... and LeaderCommit once data is really sent
 	rf.mu.Lock()
-	nextIndex := rf.nextIndex[peerIdx]
-	matchIndex := rf.matchIndex[peerIdx]
-	lastLogIdx := len(rf.log)
 	currentTerm := rf.currentTerm
 	rf.mu.Unlock()
+	// // For the initial heartbeat, just send prev entries 0, that will heartbeat and avoid
+	// // any data checking in the receiver
 	args := &AppendEntriesArgs{
 		Term:         currentTerm,
 		LeaderId:     rf.me,
-		PrevLogIndex: len(rf.log) - 1,
-		PrevLogTerm:  currentTerm,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
 		Entries:      nil,
 		LeaderCommit: rf.commitIndex,
 	}
-	if len(rf.log) == 0 {
-		// Special case for when the leader log is empty
-		args.PrevLogIndex = 0
-		args.PrevLogTerm = 0
-	}
 	reply := &AppendEntriesReply{}
-	resChan := make(chan bool)
 	// Send an initial heartbeat
-	go func() { resChan <- rf.sendAppendEntries(peerIdx, args, reply) }()
+	go func() { rf.sendAppendEntries(peerIdx, args, reply) }()
+
 	for !rf.killed() {
 		select {
-		case ok := <-resChan:
+		case <-time.After(time.Millisecond * 150):
+			// Send a request or heartbeat
+			args := &AppendEntriesArgs{}
+			reply := &AppendEntriesReply{}
+			rf.mu.Lock()
+			nextIndex := rf.nextIndex[peerIdx]
+			matchIndex := rf.matchIndex[peerIdx]
+			lastLogIdx := len(rf.log)
+
+			// Figure out which entries should be sent
+			// TODO: Create a type Log []LogEntry, and add a method GetPreviousEntry, to hide all of this
+			// extra careful checking for when nextIndex < 2
+
+			// The algorithm should ensure that nextIndex in [1, lastLogIndex+1], but double check here and reinitialize the
+			// fields if necessary
+			if nextIndex > lastLogIdx+1 || nextIndex == 0 {
+				log.Printf("Warning: Raft %d as leader has log of length %d but a next index for peer %d of %d",
+					rf.me, peerIdx, len(rf.log), nextIndex)
+				rf.nextIndex[peerIdx] = lastLogIdx + 1
+				nextIndex = lastLogIdx + 1
+				rf.matchIndex[peerIdx] = 0
+				matchIndex = 0
+				log.Printf("Raft %d restarting append entry handler for peer %d with next index %d and match index 0",
+					rf.me, peerIdx, rf.nextIndex[peerIdx])
+			}
+
+			if lastLogIdx == 0 {
+				// There are not log entries yet, just send a heartbeat
+				args.PrevLogIndex = 0
+				args.PrevLogTerm = 0
+				args.Entries = nil
+			} else if lastLogIdx == 1 {
+				// These are set to 0 to prevent the follower from checking if they match a real previous entry,
+				// which doesn't exist
+				args.PrevLogIndex = 0
+				args.PrevLogTerm = 0
+				if nextIndex == 1 {
+					args.Entries = []LogEntry{rf.log[0]}
+				} else {
+					args.Entries = nil
+				}
+			} else {
+				args.PrevLogIndex = nextIndex - 1
+				if nextIndex == 1 {
+					// Don't try to get rf.log[-1], this will turn off prevEntry checking on the follower RPC handler
+					args.PrevLogTerm = 0
+				} else {
+					// Here we can be assured that there is a previous entry in the slice
+					args.PrevLogTerm = rf.log[nextIndex-2].Term
+				}
+
+				if lastLogIdx >= nextIndex {
+					// The Raft algorithm is 1 indexed
+					args.Entries = []LogEntry{rf.log[nextIndex-1]}
+				} else {
+					args.Entries = nil
+				}
+			}
+			args.Term = rf.currentTerm
+			args.LeaderCommit = rf.commitIndex
+			rf.mu.Unlock()
+			// Send the request
+			ok := rf.sendAppendEntries(peerIdx, args, reply)
+			// Handle the responses
+			rf.mu.Lock()
+			// These values may have changed while the request was out
+			if nextIndex != rf.nextIndex[peerIdx] || matchIndex != rf.matchIndex[peerIdx] {
+				// If they did change, stop here, some other goroutine already made a request and made the updates
+				break
+			}
+			rf.mu.Unlock()
 			if !ok {
 				log.Printf("Raft %d AppendEntries to peer %d RPC network problem", rf.me, peerIdx)
 			} else if !reply.Success {
@@ -460,21 +523,26 @@ func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.
 						rf.me, peerIdx, currentTerm, reply.Term)
 					failureChan <- reply.Term
 				} else {
-					// TODO, improve this log when entries are really being sent
-					log.Printf("Raft %d AppendEntries to peer %d failed, lowering idx to try again", rf.me, peerIdx)
+					log.Printf("Raft %d AppendEntries to peer %d failed, lowering nextIndex to try again", rf.me, peerIdx)
+					rf.mu.Lock()
+					// Don't lower nextIndex < 1
+					if nextIndex > 1 {
+						rf.nextIndex[peerIdx] = nextIndex - 1
+					}
+					rf.mu.Unlock()
 				}
-
+			} else {
+				// It was successful, increment the peer arrays
+				rf.mu.Lock()
+				if args.Entries != nil {
+					rf.nextIndex[peerIdx] = nextIndex + len(args.Entries)
+					rf.matchIndex[peerIdx] = nextIndex
+				}
+				rf.mu.Unlock()
 			}
 		case <-ctx.Done():
 			log.Printf("Raft %d canceling appendEntry request for peer %d", rf.me, peerIdx)
 			return
-		case <-time.After(time.Millisecond * 150):
-			// Send an empty message as a heartbeat
-		default:
-			// If there is an entry to send, send it
-			if lastLogIdx >= nextIndex {
-
-			}
 		}
 	}
 }

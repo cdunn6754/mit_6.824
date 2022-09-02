@@ -61,13 +61,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	reply.Success = true
 	if args.Entries == nil || len(args.Entries) == 0 {
-		// Reset the log too, in case there was something in here from a previous term
-		rf.log = make([]LogEntry, 0)
+		// Nothing to do, this is probably a heartbeat, there was no new data to send
 		return
 	}
 	// For the time being only one log at a time is supported, TODO possibly optimization here
 	if len(args.Entries) > 1 {
-		log.Panic("Sending more than one command at a time is not supported.a")
+		log.Panic("Sending more than one command at a time is not supported")
 	}
 	entry := args.Entries[0]
 
