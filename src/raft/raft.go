@@ -442,7 +442,7 @@ func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.
 	for !rf.killed() {
 		select {
 		case <-time.After(time.Millisecond * 150):
-			// Send a request or heartbeat
+			// Send an append entries request or heartbeat
 			args := &AppendEntriesArgs{}
 			reply := &AppendEntriesReply{}
 			rf.mu.Lock()
@@ -454,17 +454,17 @@ func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.
 			// TODO: Create a type Log []LogEntry, and add a method GetPreviousEntry, to hide all of this
 			// extra careful checking for when nextIndex < 2
 
-			// The algorithm should ensure that nextIndex in [1, lastLogIndex+1], but double check here and reinitialize the
-			// fields if necessary
+			// The algorithm should ensure that nextIndex in [1, lastLogIndex+1], but double check here and
+			// reinitialize the fields if necessary
 			if nextIndex > lastLogIdx+1 || nextIndex == 0 {
 				log.Printf("Warning: Raft %d as leader has log of length %d but a next index for peer %d of %d",
 					rf.me, peerIdx, len(rf.log), nextIndex)
-				rf.nextIndex[peerIdx] = lastLogIdx + 1
 				nextIndex = lastLogIdx + 1
-				rf.matchIndex[peerIdx] = 0
 				matchIndex = 0
+				rf.nextIndex[peerIdx] = nextIndex
+				rf.matchIndex[peerIdx] = matchIndex
 				log.Printf("Raft %d restarting append entry handler for peer %d with next index %d and match index 0",
-					rf.me, peerIdx, rf.nextIndex[peerIdx])
+					rf.me, peerIdx, nextIndex)
 			}
 
 			if lastLogIdx == 0 {
@@ -474,21 +474,22 @@ func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.
 				args.Entries = nil
 			} else if lastLogIdx == 1 {
 				// These are set to 0 to prevent the follower from checking if they match a real previous entry,
-				// which doesn't exist
+				// which doesn't (shouldn't) exist
 				args.PrevLogIndex = 0
 				args.PrevLogTerm = 0
 				if nextIndex == 1 {
 					args.Entries = []LogEntry{rf.log[0]}
 				} else {
+					// The follower already has this single entry
 					args.Entries = nil
 				}
 			} else {
 				args.PrevLogIndex = nextIndex - 1
 				if nextIndex == 1 {
-					// Don't try to get rf.log[-1], this will turn off prevEntry checking on the follower RPC handler
+					// The follower log is empty still, so turn off prevEntry checking on the follower RPC handler
 					args.PrevLogTerm = 0
 				} else {
-					// Here we can be assured that there is a previous entry in the slice
+					// Here there is a previous entry in the slice
 					args.PrevLogTerm = rf.log[nextIndex-2].Term
 				}
 
@@ -504,6 +505,7 @@ func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.
 			rf.mu.Unlock()
 			// Send the request
 			ok := rf.sendAppendEntries(peerIdx, args, reply)
+
 			// Handle the responses
 			rf.mu.Lock()
 			// These values may have changed while the request was out
@@ -516,18 +518,22 @@ func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.
 				log.Printf("Raft %d AppendEntries to peer %d RPC network problem", rf.me, peerIdx)
 			} else if !reply.Success {
 				// Check to make sure that the term of the follower isn't higher than this term
-				// That could happen if this instance is an outdated leader, e.g. was cutoff for a while
+				// That could happen if this instance is an outdated leader, e.g. was partitioned for a while
 				// It indicates that this instance node is no longer the leader
 				if reply.Term > currentTerm {
 					log.Printf("Raft %d AppendEntries to peer %d shows failed leadership term %d, new term %d",
 						rf.me, peerIdx, currentTerm, reply.Term)
 					failureChan <- reply.Term
 				} else {
-					log.Printf("Raft %d AppendEntries to peer %d failed, lowering nextIndex to try again", rf.me, peerIdx)
 					rf.mu.Lock()
-					// Don't lower nextIndex < 1
+					// Don't let nextIndex < 1
 					if nextIndex > 1 {
 						rf.nextIndex[peerIdx] = nextIndex - 1
+						log.Printf("Raft %d AppendEntries to peer %d failed, lowering nextIndex from %d to %d ",
+							rf.me, peerIdx, nextIndex, nextIndex-1)
+					} else {
+						log.Printf("Raft %d AppendEntries to peer %d failed, but nextIndex was already at 1",
+							rf.me, peerIdx)
 					}
 					rf.mu.Unlock()
 				}
