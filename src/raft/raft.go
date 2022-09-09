@@ -421,12 +421,123 @@ func (rf *Raft) setLeaderArraysTo(nextIndex int, matchIndex int) {
 	}
 }
 
-func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.Context) {
+// Send an append entries request or heartbeat, update the leader state based on the response
+func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int) {
+
+	args := &AppendEntriesArgs{}
+	reply := &AppendEntriesReply{}
+	rf.mu.Lock()
+	nextIndex := rf.nextIndex[peerIdx]
+	matchIndex := rf.matchIndex[peerIdx]
+	currentTerm := rf.currentTerm
+	lastLogIdx := len(rf.log)
+
+	// Figure out which entries should be sent
+	// TODO: Create a type Log []LogEntry, and add a method GetPreviousEntry, to hide all of this
+	// extra careful checking for when nextIndex < 2
+
+	// The algorithm should ensure that nextIndex in [1, lastLogIndex+1], but double check here and
+	// reinitialize the fields if necessary
+	if nextIndex > lastLogIdx+1 || nextIndex == 0 {
+		log.Printf("Warning: Raft %d as leader has log of length %d but a next index for peer %d of %d",
+			rf.me, peerIdx, len(rf.log), nextIndex)
+		nextIndex = lastLogIdx + 1
+		matchIndex = 0
+		rf.nextIndex[peerIdx] = nextIndex
+		rf.matchIndex[peerIdx] = matchIndex
+		log.Printf("Raft %d restarting append entry handler for peer %d with next index %d and match index 0",
+			rf.me, peerIdx, nextIndex)
+	}
+
+	if lastLogIdx == 0 {
+		// There are not log entries yet, just send a heartbeat
+		args.PrevLogIndex = 0
+		args.PrevLogTerm = 0
+		args.Entries = nil
+	} else if lastLogIdx == 1 {
+		// These are set to 0 to prevent the follower from checking if they match a real previous entry,
+		// which doesn't (shouldn't) exist
+		args.PrevLogIndex = 0
+		args.PrevLogTerm = 0
+		if nextIndex == 1 {
+			args.Entries = []LogEntry{rf.log[0]}
+		} else {
+			// The follower already has this single entry
+			args.Entries = nil
+		}
+	} else {
+		args.PrevLogIndex = nextIndex - 1
+		if nextIndex == 1 {
+			// The follower log is empty still, so turn off prevEntry checking on the follower RPC handler
+			args.PrevLogTerm = 0
+		} else {
+			// Here there is a previous entry in the slice
+			args.PrevLogTerm = rf.log[nextIndex-2].Term
+		}
+
+		if lastLogIdx >= nextIndex {
+			// The Raft algorithm is 1 indexed
+			args.Entries = []LogEntry{rf.log[nextIndex-1]}
+		} else {
+			args.Entries = nil
+		}
+	}
+	args.Term = rf.currentTerm
+	args.LeaderCommit = rf.commitIndex
+	rf.mu.Unlock()
+
+	// Send the request
+	log.Printf("Raft %d as leader is sending an appendEntry RPC to follower %d: %+v", rf.me, peerIdx, args)
+	ok := rf.sendAppendEntries(peerIdx, args, reply)
+
+	// Handle the responses
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// These values may have changed while the request was out
+	if nextIndex != rf.nextIndex[peerIdx] || matchIndex != rf.matchIndex[peerIdx] {
+		// If they did change, stop here, some other goroutine already made a request and made the updates
+		return
+	}
+
+	if !ok {
+		log.Printf("Raft %d AppendEntries to peer %d RPC network problem", rf.me, peerIdx)
+	} else if !reply.Success {
+		// Check to make sure that the term of the follower isn't higher than this term
+		// That could happen if this instance is an outdated leader, e.g. was partitioned for a while
+		// It indicates that this instance node is no longer the leader
+		if reply.Term > currentTerm {
+			log.Printf("Raft %d AppendEntries to peer %d shows failed leadership term %d, new term %d",
+				rf.me, peerIdx, currentTerm, reply.Term)
+			failureChan <- reply.Term
+			return
+		} else {
+			// Back off the nextIndex for next time, but don't let nextIndex < 1
+			if nextIndex > 1 {
+				rf.nextIndex[peerIdx] = nextIndex - 1
+				log.Printf("Raft %d AppendEntries to peer %d failed, lowering nextIndex from %d to %d ",
+					rf.me, peerIdx, nextIndex, nextIndex-1)
+			} else {
+				log.Printf("Raft %d AppendEntries to peer %d failed, but nextIndex was already at 1",
+					rf.me, peerIdx)
+			}
+		}
+	} else {
+		// It was successful, increment the peer arrays
+		if args.Entries != nil {
+			rf.nextIndex[peerIdx] = nextIndex + len(args.Entries)
+			rf.matchIndex[peerIdx] = nextIndex
+		}
+	}
+}
+
+// Send an initial heartbeat and then start a goroutine to handle updating this peer's log
+func (rf *Raft) commandFollower(peerIdx int, failureChan chan int, ctx context.Context) {
+
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
 	rf.mu.Unlock()
-	// // For the initial heartbeat, just send prev entries 0, that will heartbeat and avoid
-	// // any data checking in the receiver
+	// For the initial heartbeat, just send prev entries 0, that will heartbeat and avoid
+	// any data checking in the receiver
 	args := &AppendEntriesArgs{
 		Term:         currentTerm,
 		LeaderId:     rf.me,
@@ -441,114 +552,11 @@ func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.
 
 	for !rf.killed() {
 		select {
-		case <-time.After(time.Millisecond * 150):
-			// Send an append entries request or heartbeat
-			args := &AppendEntriesArgs{}
-			reply := &AppendEntriesReply{}
-			rf.mu.Lock()
-			nextIndex := rf.nextIndex[peerIdx]
-			matchIndex := rf.matchIndex[peerIdx]
-			lastLogIdx := len(rf.log)
-
-			// Figure out which entries should be sent
-			// TODO: Create a type Log []LogEntry, and add a method GetPreviousEntry, to hide all of this
-			// extra careful checking for when nextIndex < 2
-
-			// The algorithm should ensure that nextIndex in [1, lastLogIndex+1], but double check here and
-			// reinitialize the fields if necessary
-			if nextIndex > lastLogIdx+1 || nextIndex == 0 {
-				log.Printf("Warning: Raft %d as leader has log of length %d but a next index for peer %d of %d",
-					rf.me, peerIdx, len(rf.log), nextIndex)
-				nextIndex = lastLogIdx + 1
-				matchIndex = 0
-				rf.nextIndex[peerIdx] = nextIndex
-				rf.matchIndex[peerIdx] = matchIndex
-				log.Printf("Raft %d restarting append entry handler for peer %d with next index %d and match index 0",
-					rf.me, peerIdx, nextIndex)
-			}
-
-			if lastLogIdx == 0 {
-				// There are not log entries yet, just send a heartbeat
-				args.PrevLogIndex = 0
-				args.PrevLogTerm = 0
-				args.Entries = nil
-			} else if lastLogIdx == 1 {
-				// These are set to 0 to prevent the follower from checking if they match a real previous entry,
-				// which doesn't (shouldn't) exist
-				args.PrevLogIndex = 0
-				args.PrevLogTerm = 0
-				if nextIndex == 1 {
-					args.Entries = []LogEntry{rf.log[0]}
-				} else {
-					// The follower already has this single entry
-					args.Entries = nil
-				}
-			} else {
-				args.PrevLogIndex = nextIndex - 1
-				if nextIndex == 1 {
-					// The follower log is empty still, so turn off prevEntry checking on the follower RPC handler
-					args.PrevLogTerm = 0
-				} else {
-					// Here there is a previous entry in the slice
-					args.PrevLogTerm = rf.log[nextIndex-2].Term
-				}
-
-				if lastLogIdx >= nextIndex {
-					// The Raft algorithm is 1 indexed
-					args.Entries = []LogEntry{rf.log[nextIndex-1]}
-				} else {
-					args.Entries = nil
-				}
-			}
-			args.Term = rf.currentTerm
-			args.LeaderCommit = rf.commitIndex
-			rf.mu.Unlock()
-			// Send the request
-			ok := rf.sendAppendEntries(peerIdx, args, reply)
-
-			// Handle the responses
-			rf.mu.Lock()
-			// These values may have changed while the request was out
-			if nextIndex != rf.nextIndex[peerIdx] || matchIndex != rf.matchIndex[peerIdx] {
-				// If they did change, stop here, some other goroutine already made a request and made the updates
-				break
-			}
-			rf.mu.Unlock()
-			if !ok {
-				log.Printf("Raft %d AppendEntries to peer %d RPC network problem", rf.me, peerIdx)
-			} else if !reply.Success {
-				// Check to make sure that the term of the follower isn't higher than this term
-				// That could happen if this instance is an outdated leader, e.g. was partitioned for a while
-				// It indicates that this instance node is no longer the leader
-				if reply.Term > currentTerm {
-					log.Printf("Raft %d AppendEntries to peer %d shows failed leadership term %d, new term %d",
-						rf.me, peerIdx, currentTerm, reply.Term)
-					failureChan <- reply.Term
-				} else {
-					rf.mu.Lock()
-					// Don't let nextIndex < 1
-					if nextIndex > 1 {
-						rf.nextIndex[peerIdx] = nextIndex - 1
-						log.Printf("Raft %d AppendEntries to peer %d failed, lowering nextIndex from %d to %d ",
-							rf.me, peerIdx, nextIndex, nextIndex-1)
-					} else {
-						log.Printf("Raft %d AppendEntries to peer %d failed, but nextIndex was already at 1",
-							rf.me, peerIdx)
-					}
-					rf.mu.Unlock()
-				}
-			} else {
-				// It was successful, increment the peer arrays
-				rf.mu.Lock()
-				if args.Entries != nil {
-					rf.nextIndex[peerIdx] = nextIndex + len(args.Entries)
-					rf.matchIndex[peerIdx] = nextIndex
-				}
-				rf.mu.Unlock()
-			}
 		case <-ctx.Done():
-			log.Printf("Raft %d canceling appendEntry request for peer %d", rf.me, peerIdx)
+			log.Printf("Raft %d canceling appendEntry request handler for peer %d", rf.me, peerIdx)
 			return
+		case <-time.After(time.Millisecond * 150):
+			go rf.appendToFollower(peerIdx, failureChan)
 		}
 	}
 }
@@ -565,8 +573,15 @@ func (rf *Raft) commandFollowers(failureChan chan int, ctx context.Context) {
 		if peerIdx == rf.me {
 			continue
 		}
-		go rf.appendToFollower(peerIdx, failureChan, ctx)
+		go rf.commandFollower(peerIdx, failureChan, ctx)
 	}
+}
+
+// Check if the leader commitIndex and lastApplied can be increased
+func (rf *Raft) commitIndexHandler() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 }
 
 // Take over as the leader server
@@ -585,12 +600,12 @@ func (rf *Raft) lead() {
 	// Send initial appendEntries leadership heartbeat immediately
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	rf.sendAllAppendEntries(failureChan, ctx)
+
 	rf.commandFollowers(failureChan, ctx)
+
+	// Now just wait for a signal that this leadership has ended
 	for !rf.killed() {
 		select {
-		case <-time.After(time.Millisecond * 150):
-			rf.sendAllAppendEntries(failureChan, ctx)
 		case hb := <-rf.heartbeatChan:
 			// Another leader sent an appendEntries rpc with a higher term
 			// exit this function to resume follower function
@@ -615,9 +630,6 @@ func (rf *Raft) lead() {
 			log.Printf("Raft %d as leader, found a candidate with a higher term %d", rf.me, newTermData.term)
 			rf.handleStateChange(StateChangeData{newTerm: newTermData.term, newState: Follower}, newTermData.wg)
 			return
-		default:
-			// See if any followers are lacking entries, and send appendEntries as necessary
-
 		}
 	}
 }

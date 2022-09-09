@@ -64,7 +64,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// Nothing to do, this is probably a heartbeat, there was no new data to send
 		return
 	}
-	// For the time being only one log at a time is supported, TODO possibly optimization here
+	// For the time being only one log entry at a time is supported, TODO optimization here
 	if len(args.Entries) > 1 {
 		log.Panic("Sending more than one command at a time is not supported")
 	}
@@ -72,10 +72,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// TODO: it might be better to check if this entry already exists here, but this accomplishes getting
 	// rid of unwanted logs and adding the new one simply
-	rf.log = append(rf.log[:args.PrevLogIndex], entry)
+	rf.updateLog(append(rf.log[:args.PrevLogIndex], entry))
 
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.log))))
+		log.Printf("Raft %d increasing commit index to %d", rf.me, rf.commitIndex)
 	}
 }
 
