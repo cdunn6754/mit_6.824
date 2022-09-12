@@ -421,7 +421,8 @@ func (rf *Raft) setLeaderArraysTo(nextIndex int, matchIndex int) {
 	}
 }
 
-// Send an append entries request or heartbeat, update the leader state based on the response
+// A long running goroutine to send an append entries requests or heartbeats and update the leader state based
+// on the response
 func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int) {
 
 	args := &AppendEntriesArgs{}
@@ -577,11 +578,52 @@ func (rf *Raft) commandFollowers(failureChan chan int, ctx context.Context) {
 	}
 }
 
-// Check if the leader commitIndex and lastApplied can be increased
+// Long running goroutine to periodically check if the leader commitIndex and lastApplied can be increased
 func (rf *Raft) commitIndexHandler() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	// From the paper:
+	// "If there exists an N such that N > commitIndex, a majority
+	// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+	// set commitIndex = N (sections 5.3 & 5.4)"
+	for !rf.killed() {
+		select {
+		case <-time.After(time.Millisecond * 100):
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			n := rf.commitIndex + 1
+			if n > len(rf.log) {
+				// We are up to date, there is no new entries to commit
+				break
+			}
+			// Need to get to an entry with the current term at least
+			for n <= len(rf.log) {
+				entry := rf.log[n-1]
+				if entry.Term == rf.currentTerm {
+					// Start the search here, this could be the next to commit
+					break
+				}
+				n++
+			}
+			entry := rf.log[n-1]
+			if entry.Term != rf.currentTerm {
+				// There are no entries newer than the commitIndex entry that have term == rf.currentTerm
+				break
+			}
 
+			// At this point we have n > commitIndex, and n.Term == rf.currentTerm, now check
+			// if a majority of instances match
+			// TODO: probably just iterate upwards to find the highest possible index to be committed, but
+			// keep it simple for now and just check this one
+			matchCount := 0
+			for _, mIdx := range rf.matchIndex {
+				if mIdx >= n {
+					matchCount += 1
+				}
+			}
+			if matchCount > len(rf.log)/2 {
+				rf.commitIndex = n
+			}
+		}
+	}
 }
 
 // Take over as the leader server
