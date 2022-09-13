@@ -119,6 +119,11 @@ func (rf *Raft) updateLog(newLog []LogEntry) {
 	rf.persist()
 }
 
+func (rf *Raft) appendToLog(entry LogEntry) {
+	rf.log = append(rf.log, entry)
+	rf.persist()
+}
+
 // If the nextIndex or matchIndex arrays contain values other than -1
 // this instance is a leader
 func (rf *Raft) isLeader() bool {
@@ -269,11 +274,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := len(rf.log) + 1
 	term := rf.currentTerm
 	if rf.isLeader() {
-		// Append entry to the log
-		newEntry := LogEntry{Term: term, Command: command}
-		rf.log = append(rf.log, newEntry)
-		rf.persist()
-		// The lead goroutine will handle disseminating this info to the other instances
+		rf.appendToLog(LogEntry{Term: term, Command: command})
 	}
 	return index, term, rf.isLeader()
 }
@@ -423,8 +424,8 @@ func (rf *Raft) setLeaderArraysTo(nextIndex int, matchIndex int) {
 
 // A long running goroutine to send an append entries requests or heartbeats and update the leader state based
 // on the response
-func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int) {
-
+func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
 	args := &AppendEntriesArgs{}
 	reply := &AppendEntriesReply{}
 	rf.mu.Lock()
@@ -509,7 +510,12 @@ func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int) {
 		if reply.Term > currentTerm {
 			log.Printf("Raft %d AppendEntries to peer %d shows failed leadership term %d, new term %d",
 				rf.me, peerIdx, currentTerm, reply.Term)
-			failureChan <- reply.Term
+
+			// Don't block tring to send to failureChan if another sender already failed and cancelled ctx
+			select {
+			case <-ctx.Done():
+			case failureChan <- reply.Term:
+			}
 			return
 		} else {
 			// Back off the nextIndex for next time, but don't let nextIndex < 1
@@ -532,8 +538,8 @@ func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int) {
 }
 
 // Send an initial heartbeat and then start a goroutine to handle updating this peer's log
-func (rf *Raft) commandFollower(peerIdx int, failureChan chan int, ctx context.Context) {
-
+func (rf *Raft) commandFollower(peerIdx int, failureChan chan int, ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
 	rf.mu.Unlock()
@@ -557,13 +563,14 @@ func (rf *Raft) commandFollower(peerIdx int, failureChan chan int, ctx context.C
 			log.Printf("Raft %d canceling appendEntry request handler for peer %d", rf.me, peerIdx)
 			return
 		case <-time.After(time.Millisecond * 150):
-			go rf.appendToFollower(peerIdx, failureChan)
+			wg.Add(1)
+			go rf.appendToFollower(peerIdx, failureChan, ctx, wg)
 		}
 	}
 }
 
 // Set up goroutines for each peer that will continuously work to keep follower logs up to date
-func (rf *Raft) commandFollowers(failureChan chan int, ctx context.Context) {
+func (rf *Raft) commandFollowers(failureChan chan int, ctx context.Context, wg *sync.WaitGroup) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -574,7 +581,8 @@ func (rf *Raft) commandFollowers(failureChan chan int, ctx context.Context) {
 		if peerIdx == rf.me {
 			continue
 		}
-		go rf.commandFollower(peerIdx, failureChan, ctx)
+		wg.Add(1)
+		go rf.commandFollower(peerIdx, failureChan, ctx, wg)
 	}
 }
 
@@ -641,38 +649,41 @@ func (rf *Raft) lead() {
 	failureChan := make(chan int)
 	// Send initial appendEntries leadership heartbeat immediately
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	rf.commandFollowers(failureChan, ctx)
+	wg := &sync.WaitGroup{}
+	rf.commandFollowers(failureChan, ctx, wg)
 
 	// Now just wait for a signal that this leadership has ended
-	for !rf.killed() {
-		select {
-		case hb := <-rf.heartbeatChan:
-			// Another leader sent an appendEntries rpc with a higher term
-			// exit this function to resume follower function
-			if hb.newTerm == currentTerm {
-				// There is a problem if two leaders were elected for the same term
-				log.Panicf("Raft %d as leader in term %d received a heartbeat from leader instance %d in term %d",
-					rf.me, currentTerm, hb.leaderId, hb.newTerm)
-			}
-			log.Printf("Raft %d as leader, received a heartbeat from leader with a greater term: %+v, now becoming follower.",
-				rf.me, hb)
-			rf.handleStateChange(StateChangeData{newTerm: hb.newTerm, newState: Follower}, nil)
-			return
-		case newTerm := <-failureChan:
-			// Heard from a follower that this instance is no longer the leader
-			// Transition state back to follower, exit this function to resume follower function
-			log.Printf("Raft %d as leader, found a follower with a higher term %d", rf.me, newTerm)
-			rf.handleStateChange(StateChangeData{newTerm: newTerm, newState: Follower}, nil)
-			return
-		case newTermData := <-rf.newTermChan:
-			// Heard from a candidate with a higher term.
-			// Transition state back to follower, exit this function to resume follower function, in the higher term
-			log.Printf("Raft %d as leader, found a candidate with a higher term %d", rf.me, newTermData.term)
-			rf.handleStateChange(StateChangeData{newTerm: newTermData.term, newState: Follower}, newTermData.wg)
-			return
+	select {
+	case hb := <-rf.heartbeatChan:
+		// Another leader sent an appendEntries rpc with a higher term
+		// exit this function to resume follower function
+		if hb.newTerm == currentTerm {
+			// There is a problem if two leaders were elected for the same term
+			log.Panicf("Raft %d as leader in term %d received a heartbeat from leader instance %d in term %d",
+				rf.me, currentTerm, hb.leaderId, hb.newTerm)
 		}
+		log.Printf("Raft %d as leader, received a heartbeat from leader with a greater term: %+v, now becoming follower.",
+			rf.me, hb)
+		cancel()
+		wg.Wait()
+		rf.handleStateChange(StateChangeData{newTerm: hb.newTerm, newState: Follower}, nil)
+		return
+	case newTerm := <-failureChan:
+		// Heard from a follower that this instance is no longer the leader
+		// Transition state back to follower, exit this function to resume follower function
+		log.Printf("Raft %d as leader, found a follower with a higher term %d", rf.me, newTerm)
+		cancel()
+		wg.Wait()
+		rf.handleStateChange(StateChangeData{newTerm: newTerm, newState: Follower}, nil)
+		return
+	case newTermData := <-rf.newTermChan:
+		// Heard from a candidate with a higher term.
+		// Transition state back to follower, exit this function to resume follower function, in the higher term
+		log.Printf("Raft %d as leader, found a candidate with a higher term %d", rf.me, newTermData.term)
+		cancel()
+		wg.Wait()
+		rf.handleStateChange(StateChangeData{newTerm: newTermData.term, newState: Follower}, newTermData.wg)
+		return
 	}
 }
 
@@ -681,8 +692,9 @@ func (rf *Raft) handleStateChange(stateChangeData StateChangeData, wg *sync.Wait
 	if wg != nil {
 		defer wg.Done()
 	}
-
+	log.Printf("Raft %d getting lock in state change", rf.me)
 	rf.mu.Lock()
+	log.Printf("Raft %d got the lock in state change", rf.me)
 	currentTerm := rf.currentTerm
 	rf.mu.Unlock()
 	// TODO: Could probably make a map of valid transition pairs, and provide a function for each, that way
