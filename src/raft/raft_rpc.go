@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"context"
 	"log"
 	"math"
 	"sync"
@@ -83,54 +82,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) sendAppendEntries(peerIdx int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[peerIdx].Call("Raft.AppendEntries", args, reply)
 	return ok
-}
-
-func (rf *Raft) sendAllAppendEntries(failureChan chan int, ctx context.Context) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	currentTerm := rf.currentTerm
-	log.Printf("Raft %d sending all append entries, term %d", rf.me, currentTerm)
-	for peerIdx := range rf.peers {
-		if peerIdx == rf.me {
-			continue
-		}
-		go func(peerIdx int, currentTerm int) {
-			// TODO: update PrevLog... and LeaderCommit once data is really sent
-			args := &AppendEntriesArgs{
-				Term:         currentTerm,
-				LeaderId:     rf.me,
-				PrevLogIndex: -1,
-				PrevLogTerm:  currentTerm,
-				Entries:      nil,
-				LeaderCommit: -1,
-			}
-			reply := &AppendEntriesReply{}
-			resChan := make(chan bool)
-			go func() { resChan <- rf.sendAppendEntries(peerIdx, args, reply) }()
-			select {
-			case ok := <-resChan:
-				if !ok {
-					log.Printf("Raft %d AppendEntries to peer %d RPC network problem", rf.me, peerIdx)
-				} else if !reply.Success {
-					// Check to make sure that the term of the follower isn't higher than this term
-					// That could happen if this instance is an outdated leader, e.g. was cutoff for a while
-					// It indicates that this instance node is no longer the leader
-					if reply.Term > currentTerm {
-						log.Printf("Raft %d AppendEntries to peer %d shows failed leadership term %d, new term %d",
-							rf.me, peerIdx, currentTerm, reply.Term)
-						failureChan <- reply.Term
-					} else {
-						// TODO, improve this log when entries are really being sent
-						log.Printf("Raft %d AppendEntries to peer %d failed, lowering idx to try again", rf.me, peerIdx)
-					}
-
-				}
-			case <-ctx.Done():
-				log.Printf("Raft %d canceling appendEntry request for peer %d", rf.me, peerIdx)
-				return
-			}
-		}(peerIdx, currentTerm)
-	}
 }
 
 //
