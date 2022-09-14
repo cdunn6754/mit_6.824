@@ -120,6 +120,8 @@ func (rf *Raft) updateLog(newLog []LogEntry) {
 }
 
 func (rf *Raft) appendToLog(entry LogEntry) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.log = append(rf.log, entry)
 	rf.persist()
 }
@@ -269,14 +271,17 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	log.Printf("Raft %d received user command %v", rf.me, command)
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	index := len(rf.log) + 1
 	term := rf.currentTerm
-	if rf.isLeader() {
+	rf.mu.Unlock()
+	isLeader := rf.isLeader()
+	if isLeader {
+		log.Printf("Raft %d, as leader, is appending command %v, to log", rf.me, command)
 		rf.appendToLog(LogEntry{Term: term, Command: command})
 	}
-	return index, term, rf.isLeader()
+	return index, term, isLeader
 }
 
 //
@@ -587,19 +592,22 @@ func (rf *Raft) commandFollowers(failureChan chan int, ctx context.Context, wg *
 }
 
 // Long running goroutine to periodically check if the leader commitIndex and lastApplied can be increased
-func (rf *Raft) commitIndexHandler() {
+func (rf *Raft) commitIndexHandler(ctx context.Context, wg *sync.WaitGroup) {
 	// From the paper:
 	// "If there exists an N such that N > commitIndex, a majority
 	// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
 	// set commitIndex = N (sections 5.3 & 5.4)"
+	defer wg.Done()
 	for !rf.killed() {
 		select {
+		case <-ctx.Done():
+			return
 		case <-time.After(time.Millisecond * 100):
 			rf.mu.Lock()
-			defer rf.mu.Unlock()
 			n := rf.commitIndex + 1
 			if n > len(rf.log) {
 				// We are up to date, there is no new entries to commit
+				rf.mu.Unlock()
 				break
 			}
 			// Need to get to an entry with the current term at least
@@ -614,6 +622,7 @@ func (rf *Raft) commitIndexHandler() {
 			entry := rf.log[n-1]
 			if entry.Term != rf.currentTerm {
 				// There are no entries newer than the commitIndex entry that have term == rf.currentTerm
+				rf.mu.Unlock()
 				break
 			}
 
@@ -630,6 +639,7 @@ func (rf *Raft) commitIndexHandler() {
 			if matchCount > len(rf.log)/2 {
 				rf.commitIndex = n
 			}
+			rf.mu.Unlock()
 		}
 	}
 }
@@ -650,6 +660,7 @@ func (rf *Raft) lead() {
 	// Send initial appendEntries leadership heartbeat immediately
 	ctx, cancel := context.WithCancel(context.Background())
 	wg := &sync.WaitGroup{}
+	rf.commitIndexHandler(ctx, wg)
 	rf.commandFollowers(failureChan, ctx, wg)
 
 	// Now just wait for a signal that this leadership has ended
@@ -692,9 +703,9 @@ func (rf *Raft) handleStateChange(stateChangeData StateChangeData, wg *sync.Wait
 	if wg != nil {
 		defer wg.Done()
 	}
-	log.Printf("Raft %d getting lock in state change", rf.me)
+	// log.Printf("Raft %d getting lock in state change", rf.me)
 	rf.mu.Lock()
-	log.Printf("Raft %d got the lock in state change", rf.me)
+	// log.Printf("Raft %d got the lock in state change", rf.me)
 	currentTerm := rf.currentTerm
 	rf.mu.Unlock()
 	// TODO: Could probably make a map of valid transition pairs, and provide a function for each, that way
