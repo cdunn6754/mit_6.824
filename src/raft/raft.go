@@ -516,7 +516,7 @@ func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.
 			log.Printf("Raft %d AppendEntries to peer %d shows failed leadership term %d, new term %d",
 				rf.me, peerIdx, currentTerm, reply.Term)
 
-			// Don't block tring to send to failureChan if another sender already failed and cancelled ctx
+			// Don't block trying to send to failureChan if another sender already failed and cancelled ctx
 			select {
 			case <-ctx.Done():
 			case failureChan <- reply.Term:
@@ -597,10 +597,12 @@ func (rf *Raft) commitIndexHandler(ctx context.Context, wg *sync.WaitGroup) {
 	// "If there exists an N such that N > commitIndex, a majority
 	// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
 	// set commitIndex = N (sections 5.3 & 5.4)"
+	log.Printf("Raft %d as leader is starting the commitIndexHandler", rf.me)
 	defer wg.Done()
 	for !rf.killed() {
 		select {
 		case <-ctx.Done():
+			log.Printf("Raft %d stopping the commitIndexHandler", rf.me)
 			return
 		case <-time.After(time.Millisecond * 100):
 			rf.mu.Lock()
@@ -660,7 +662,7 @@ func (rf *Raft) lead() {
 	// Send initial appendEntries leadership heartbeat immediately
 	ctx, cancel := context.WithCancel(context.Background())
 	wg := &sync.WaitGroup{}
-	rf.commitIndexHandler(ctx, wg)
+	go rf.commitIndexHandler(ctx, wg)
 	rf.commandFollowers(failureChan, ctx, wg)
 
 	// Now just wait for a signal that this leadership has ended
