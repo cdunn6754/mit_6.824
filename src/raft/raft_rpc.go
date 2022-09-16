@@ -59,6 +59,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Success = true
+	// Check if the Leader has decided that any of the entries are committed
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.log))))
+		log.Printf("Raft %d increasing commit index to %d", rf.me, rf.commitIndex)
+	}
+
 	if args.Entries == nil || len(args.Entries) == 0 {
 		// Nothing to do, this is probably a heartbeat, there was no new data to send
 		return
@@ -72,11 +78,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// TODO: it might be better to check if this entry already exists here, but this accomplishes getting
 	// rid of unwanted logs and adding the new one simply
 	rf.updateLog(append(rf.log[:args.PrevLogIndex], entry))
-
-	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.log))))
-		log.Printf("Raft %d increasing commit index to %d", rf.me, rf.commitIndex)
-	}
 }
 
 func (rf *Raft) sendAppendEntries(peerIdx int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
