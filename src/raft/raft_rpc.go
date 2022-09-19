@@ -60,9 +60,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	reply.Success = true
 	// Check if the Leader has decided that any of the entries are committed
-	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.log))))
-		log.Printf("Raft %d increasing commit index to %d", rf.me, rf.commitIndex)
+	newCommitIdx := int(math.Min(float64(args.LeaderCommit), float64(len(rf.log))))
+	if newCommitIdx > rf.commitIndex {
+		rf.commitIndex = newCommitIdx
+		log.Printf("Raft %d increasing commit index to %d", rf.me, newCommitIdx)
+		rf.applyMsgChan <- ApplyMsg{
+			CommandValid: true,
+			CommandIndex: newCommitIdx,
+			Command:      rf.log[newCommitIdx-1].Command,
+		}
 	}
 
 	if args.Entries == nil || len(args.Entries) == 0 {

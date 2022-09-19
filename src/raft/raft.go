@@ -94,6 +94,7 @@ type Raft struct {
 	_isCandidate  bool
 	heartbeatChan chan HeartbeatData // Channel to indicate a successful heartbeat from an appendEntry
 	newTermChan   chan NewTermData   // Channel that rpc functions can use to interrupt when they get a higher term in a request
+	applyMsgChan  chan ApplyMsg
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -271,7 +272,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	log.Printf("Raft %d received user command %v", rf.me, command)
 	rf.mu.Lock()
 	index := len(rf.log) + 1
 	term := rf.currentTerm
@@ -624,6 +624,7 @@ func (rf *Raft) commitIndexHandler(ctx context.Context, wg *sync.WaitGroup) {
 			entry := rf.log[n-1]
 			if entry.Term != rf.currentTerm {
 				// There are no entries newer than the commitIndex entry that have term == rf.currentTerm
+				// So nothing can be committed until something is logged from this term on a majority of instances
 				rf.mu.Unlock()
 				break
 			}
@@ -640,6 +641,12 @@ func (rf *Raft) commitIndexHandler(ctx context.Context, wg *sync.WaitGroup) {
 			}
 			if matchCount > len(rf.log)/2 {
 				rf.commitIndex = n
+				log.Printf("Raft %d, as leader increasing commit index to %d", rf.me, rf.commitIndex)
+				rf.applyMsgChan <- ApplyMsg{
+					CommandValid: true,
+					CommandIndex: n,
+					Command:      rf.log[n-1].Command,
+				}
 			}
 			rf.mu.Unlock()
 		}
@@ -805,6 +812,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf._isCandidate = false
 	rf.heartbeatChan = make(chan HeartbeatData)
 	rf.newTermChan = make(chan NewTermData)
+	rf.applyMsgChan = applyCh
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.log = make([]LogEntry, 0)
