@@ -494,7 +494,7 @@ func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.
 	rf.mu.Unlock()
 
 	// Send the request
-	log.Printf("Raft %d as leader is sending an appendEntry RPC to follower %d: %+v", rf.me, peerIdx, args)
+	// log.Printf("Raft %d as leader is sending an appendEntry RPC to follower %d: %+v", rf.me, peerIdx, args)
 	ok := rf.sendAppendEntries(peerIdx, args, reply)
 
 	// Handle the responses
@@ -669,6 +669,7 @@ func (rf *Raft) lead() {
 	// Send initial appendEntries leadership heartbeat immediately
 	ctx, cancel := context.WithCancel(context.Background())
 	wg := &sync.WaitGroup{}
+	wg.Add(1)
 	go rf.commitIndexHandler(ctx, wg)
 	rf.commandFollowers(failureChan, ctx, wg)
 
