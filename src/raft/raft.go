@@ -503,6 +503,7 @@ func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.
 	// These values may have changed while the request was out
 	if nextIndex != rf.nextIndex[peerIdx] || matchIndex != rf.matchIndex[peerIdx] {
 		// If they did change, stop here, some other goroutine already made a request and made the updates
+		log.Printf("Raft %d is skipping an update because of outdated nextIndex or matchIndex", rf.me)
 		return
 	}
 
@@ -634,12 +635,17 @@ func (rf *Raft) commitIndexHandler(ctx context.Context, wg *sync.WaitGroup) {
 			// TODO: probably just iterate upwards to find the highest possible index to be committed, but
 			// keep it simple for now and just check this one
 			matchCount := 0
-			for _, mIdx := range rf.matchIndex {
+			for idx, mIdx := range rf.matchIndex {
+				if idx == rf.me {
+					// The leader has this entry its log
+					matchCount += 1
+					continue
+				}
 				if mIdx >= n {
 					matchCount += 1
 				}
 			}
-			if matchCount > len(rf.log)/2 {
+			if matchCount > len(rf.peers)/2 {
 				rf.commitIndex = n
 				log.Printf("Raft %d, as leader increasing commit index to %d", rf.me, rf.commitIndex)
 				rf.applyMsgChan <- ApplyMsg{
