@@ -363,7 +363,7 @@ func (rf *Raft) campaign() {
 			rf.handleStateChange(StateChangeData{newTerm: newTermData.term, newState: Follower}, newTermData.wg)
 		case <-timeoutChan:
 			log.Printf("Raft %d timed out while campaigning in term %d", rf.me, currentTerm)
-			rf.handleStateChange(StateChangeData{newTerm: currentTerm + 1, newState: Candidate}, nil)
+			rf.handleStateChange(StateChangeData{newTerm: currentTerm, newState: Follower}, nil)
 			// TODO: use a context to cancel requests here and for heartbeat
 			return
 		case result := <-resultChan:
@@ -382,7 +382,7 @@ func (rf *Raft) campaign() {
 			// keep it simple
 			if votesReceived == voterCount {
 				log.Printf("Raft %d while campaigning failed to win in term %d", rf.me, currentTerm)
-				rf.handleStateChange(StateChangeData{newTerm: currentTerm + 1, newState: Candidate}, nil)
+				rf.handleStateChange(StateChangeData{newTerm: currentTerm, newState: Follower}, nil)
 				return
 			}
 		}
