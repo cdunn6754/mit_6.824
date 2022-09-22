@@ -430,7 +430,6 @@ func (rf *Raft) setLeaderArraysTo(nextIndex int, matchIndex int) {
 // A long running goroutine to send an append entries requests or heartbeats and update the leader state based
 // on the response
 func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.Context, wg *sync.WaitGroup) {
-	defer wg.Done()
 	args := &AppendEntriesArgs{}
 	reply := &AppendEntriesReply{}
 	rf.mu.Lock()
@@ -569,7 +568,6 @@ func (rf *Raft) commandFollower(peerIdx int, failureChan chan int, ctx context.C
 			log.Printf("Raft %d canceling appendEntry request handler for peer %d", rf.me, peerIdx)
 			return
 		case <-time.After(time.Millisecond * 150):
-			wg.Add(1)
 			go rf.appendToFollower(peerIdx, failureChan, ctx, wg)
 		}
 	}
