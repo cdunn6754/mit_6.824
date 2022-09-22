@@ -614,18 +614,19 @@ func (rf *Raft) commitIndexHandler(ctx context.Context, wg *sync.WaitGroup) {
 				break
 			}
 			// Need to get to an entry with the current term at least
+			var entry LogEntry
 			for n <= len(rf.log) {
-				entry := rf.log[n-1]
+				entry = rf.log[n-1]
 				if entry.Term == rf.currentTerm {
 					// Start the search here, this could be the next to commit
 					break
 				}
 				n++
 			}
-			entry := rf.log[n-1]
-			if entry.Term != rf.currentTerm {
-				// There are no entries newer than the commitIndex entry that have term == rf.currentTerm
-				// So nothing can be committed until something is logged from this term on a majority of instances
+			if n > len(rf.log) {
+				// We went through all of the log entries and didn't find one from this term,
+				// so nothing can be committed now
+				log.Printf("Raft %d can't commit because the latest entries aren't from this term", rf.me)
 				rf.mu.Unlock()
 				break
 			}
