@@ -660,12 +660,18 @@ func (rf *Raft) commitIndexHandler(ctx context.Context, wg *sync.WaitGroup) {
 				}
 			}
 			if matchCount > len(rf.peers)/2 {
-				rf.commitIndex = n
+				if rf.commitIndex+1 < n {
+					// Any entries that couldn't be committed before, should be now, e.g entries from previous terms
+					// The next time this loop runs, it will commit the next index until it reaches and commits n
+					rf.commitIndex += 1
+				} else {
+					rf.commitIndex = n
+				}
 				log.Printf("Raft %d, as leader increasing commit index to %d", rf.me, rf.commitIndex)
 				rf.applyMsgChan <- ApplyMsg{
 					CommandValid: true,
-					CommandIndex: n,
-					Command:      rf.log[n-1].Command,
+					CommandIndex: rf.commitIndex,
+					Command:      rf.log[rf.commitIndex-1].Command,
 				}
 			}
 			rf.mu.Unlock()
