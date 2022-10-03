@@ -62,12 +62,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Check if the Leader has decided that any of the entries are committed
 	newCommitIdx := int(math.Min(float64(args.LeaderCommit), float64(len(rf.log))))
 	if newCommitIdx > rf.commitIndex {
-		rf.commitIndex = newCommitIdx
-		log.Printf("Raft %d increasing commit index to %d", rf.me, newCommitIdx)
+		// Any entries that couldn't be committed before, should be now, e.g entries from previous terms
+		// The next time an appendEntry call is made, it will commit the next index until it reaches and commits newCommitIdx
+		// TODO: put this in a loop so that a single appendEntry call results in this follower getting
+		// caught up on the commit indexes
+		rf.stepCommitIdx(newCommitIdx)
+		log.Printf("Raft %d increasing commit index to %d", rf.me, rf.commitIndex)
 		rf.applyMsgChan <- ApplyMsg{
 			CommandValid: true,
-			CommandIndex: newCommitIdx,
-			Command:      rf.log[newCommitIdx-1].Command,
+			CommandIndex: rf.commitIndex,
+			Command:      rf.log[rf.commitIndex-1].Command,
 		}
 	}
 

@@ -127,6 +127,18 @@ func (rf *Raft) appendToLog(entry LogEntry) {
 	rf.persist()
 }
 
+// Given a new valid commitIndex, step the commit index up to the next in order, the entries must be
+// committed in order. I.e., don't skip any entries that were uncommitted previously because of
+// an old term.
+// Not thread safe
+func (rf *Raft) stepCommitIdx(newCommitIdx int) {
+	if rf.commitIndex+1 < newCommitIdx {
+		rf.commitIndex += 1
+	} else {
+		rf.commitIndex = newCommitIdx
+	}
+}
+
 // If the nextIndex or matchIndex arrays contain values other than -1
 // this instance is a leader
 func (rf *Raft) isLeader() bool {
@@ -660,13 +672,9 @@ func (rf *Raft) commitIndexHandler(ctx context.Context, wg *sync.WaitGroup) {
 				}
 			}
 			if matchCount > len(rf.peers)/2 {
-				if rf.commitIndex+1 < n {
-					// Any entries that couldn't be committed before, should be now, e.g entries from previous terms
-					// The next time this loop runs, it will commit the next index until it reaches and commits n
-					rf.commitIndex += 1
-				} else {
-					rf.commitIndex = n
-				}
+				// Any entries that couldn't be committed before, should be now, e.g entries from previous terms
+				// The next time this loop runs, it will commit the next index until it reaches and commits n
+				rf.stepCommitIdx(n)
 				log.Printf("Raft %d, as leader increasing commit index to %d", rf.me, rf.commitIndex)
 				rf.applyMsgChan <- ApplyMsg{
 					CommandValid: true,
