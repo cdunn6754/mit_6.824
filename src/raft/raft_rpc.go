@@ -83,6 +83,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// TODO: it might be better to check if this entry already exists here, but this accomplishes getting
 	// rid of unwanted logs and adding the new one simply
+	log.Printf("Raft %d adding entry %v to log at index %d", rf.me, entry.Command, len(rf.log)+1)
 	rf.updateLog(append(rf.log[:args.PrevLogIndex], entry))
 }
 

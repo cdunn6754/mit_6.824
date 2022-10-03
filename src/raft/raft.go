@@ -275,10 +275,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	index := len(rf.log) + 1
 	term := rf.currentTerm
+	logLen := len(rf.log)
 	rf.mu.Unlock()
 	isLeader := rf.isLeader()
 	if isLeader {
-		log.Printf("Raft %d, as leader, is appending command %v, to log", rf.me, command)
+		log.Printf("Raft %d, as leader, is appending command %v, to log index %d", rf.me, command, logLen+1)
 		rf.appendToLog(LogEntry{Term: term, Command: command})
 	}
 	return index, term, isLeader
@@ -429,7 +430,7 @@ func (rf *Raft) setLeaderArraysTo(nextIndex int, matchIndex int) {
 
 // A long running goroutine to send an append entries requests or heartbeats and update the leader state based
 // on the response
-func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.Context, wg *sync.WaitGroup) {
+func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.Context) {
 	args := &AppendEntriesArgs{}
 	reply := &AppendEntriesReply{}
 	rf.mu.Lock()
@@ -490,19 +491,33 @@ func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.
 	}
 	args.Term = rf.currentTerm
 	args.LeaderCommit = rf.commitIndex
+	args.LeaderId = rf.me
 	rf.mu.Unlock()
 
 	// Send the request
 	// log.Printf("Raft %d as leader is sending an appendEntry RPC to follower %d: %+v", rf.me, peerIdx, args)
 	ok := rf.sendAppendEntries(peerIdx, args, reply)
 
+	// Don't do anything if this instance isn't the leader anymore
+	// TODO: this isLeader check is a little costly, I think a better solution might be to
+	// pass a channel from the commandFollower fcn that closes when the ctx is canceled, i.e. when leadership
+	// is lost. Then check for that here like select{ case <-lostLeadership: return default: pass}. This seems like
+	// a good way to cache the state locally.
+	if !rf.isLeader() {
+		log.Printf("Raft %d is ignoring the appendEntries response for peer %d because it is no longer the leader",
+			rf.me, peerIdx)
+		return
+	}
 	// Handle the responses
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// These values may have changed while the request was out
+
+	// These values may have changed while the request was out, from a concurrent appendToFollower goroutine
+	// for this same peerIdx
 	if nextIndex != rf.nextIndex[peerIdx] || matchIndex != rf.matchIndex[peerIdx] {
 		// If they did change, stop here, some other goroutine already made a request and made the updates
-		log.Printf("Raft %d is skipping an update because of outdated nextIndex or matchIndex", rf.me)
+		log.Printf("Raft %d is ignoring the appendEntries response for peer %d because of outdated an nextIndex or matchIndex",
+			rf.me, peerIdx)
 		return
 	}
 
@@ -568,7 +583,7 @@ func (rf *Raft) commandFollower(peerIdx int, failureChan chan int, ctx context.C
 			log.Printf("Raft %d canceling appendEntry request handler for peer %d", rf.me, peerIdx)
 			return
 		case <-time.After(time.Millisecond * 150):
-			go rf.appendToFollower(peerIdx, failureChan, ctx, wg)
+			go rf.appendToFollower(peerIdx, failureChan, ctx)
 		}
 	}
 }
