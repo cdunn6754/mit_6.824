@@ -120,11 +120,12 @@ func (rf *Raft) updateLog(newLog []LogEntry) {
 	rf.persist()
 }
 
-func (rf *Raft) appendToLog(entry LogEntry) {
+func (rf *Raft) appendToLog(entry LogEntry) int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.log = append(rf.log, entry)
 	rf.persist()
+	return len(rf.log)
 }
 
 // Given a new valid commitIndex, step the commit index up to the next in order, the entries must be
@@ -285,14 +286,14 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
-	index := len(rf.log) + 1
+	index := 0
 	term := rf.currentTerm
 	logLen := len(rf.log)
 	rf.mu.Unlock()
 	isLeader := rf.isLeader()
 	if isLeader {
 		log.Printf("Raft %d, as leader, is appending command %v, to log index %d", rf.me, command, logLen+1)
-		rf.appendToLog(LogEntry{Term: term, Command: command})
+		index = rf.appendToLog(LogEntry{Term: term, Command: command})
 	}
 	return index, term, isLeader
 }
@@ -675,11 +676,13 @@ func (rf *Raft) commitIndexHandler(ctx context.Context, wg *sync.WaitGroup) {
 				// Any entries that couldn't be committed before, should be now, e.g entries from previous terms
 				// The next time this loop runs, it will commit the next index until it reaches and commits n
 				rf.stepCommitIdx(n)
-				log.Printf("Raft %d, as leader increasing commit index to %d", rf.me, rf.commitIndex)
+				cmd := rf.log[rf.commitIndex-1].Command
+				log.Printf("Raft %d, as leader increasing commit index to %d for message %+v",
+					rf.me, rf.commitIndex, cmd)
 				rf.applyMsgChan <- ApplyMsg{
 					CommandValid: true,
 					CommandIndex: rf.commitIndex,
-					Command:      rf.log[rf.commitIndex-1].Command,
+					Command:      cmd,
 				}
 			}
 			rf.mu.Unlock()
