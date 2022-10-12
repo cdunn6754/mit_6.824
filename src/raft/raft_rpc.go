@@ -47,7 +47,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// Check that the previous log entry term matches, otherwise drop it from this log and fail
 		logEntry := rf.log[args.PrevLogIndex-1]
 		if logEntry.Term != args.PrevLogTerm {
+			rf.mu.Lock()
 			rf.updateLog(rf.log[:args.PrevLogIndex])
+			rf.mu.Unlock()
 			log.Printf("Raft %d can't append entry because it has a term mismatch with PrevLogTerm %d",
 				rf.me, args.PrevLogTerm)
 			reply.Success = false
@@ -87,8 +89,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// TODO: it might be better to check if this entry already exists here, but this accomplishes getting
 	// rid of unwanted logs and adding the new one simply
-	log.Printf("Raft %d adding entry %v to log at index %d", rf.me, entry.Command, len(rf.log)+1)
 	rf.updateLog(append(rf.log[:args.PrevLogIndex], entry))
+	log.Printf("Raft %d adding entry %v to log at index %d", rf.me, entry.Command, len(rf.log))
 }
 
 func (rf *Raft) sendAppendEntries(peerIdx int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
