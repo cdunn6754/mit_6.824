@@ -133,6 +133,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.newTermChan <- data
 	}
 	wg.Wait()
+
+	lastLogTerm := rf.getLastLogTerm()
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
@@ -140,9 +142,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Check on the RAFT algorithm logic here
 	// validLog checks election restriction (Sec. 5.4.1 from the paper)
 	validLog := false
-	if args.Term > rf.currentTerm {
+	if args.LastLogTerm > lastLogTerm {
 		validLog = true
-	} else if args.Term == rf.currentTerm && args.LastLogIndex >= len(rf.log) {
+	} else if args.LastLogTerm == lastLogTerm && args.LastLogIndex >= len(rf.log) {
 		validLog = true
 	}
 	noVote := rf.votedFor == -1 || rf.votedFor == args.CandidateId

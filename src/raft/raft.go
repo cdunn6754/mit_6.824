@@ -177,6 +177,16 @@ func (rf *Raft) getState() RaftState {
 	}
 }
 
+// Get the term of the latest log entry, if there is none, return 0
+func (rf *Raft) getLastLogTerm() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if len(rf.log) == 0 {
+		return 0
+	}
+	return rf.log[len(rf.log)-1].Term
+}
+
 // Set this instance's state as a follower, often this is used as the result of a receiving an RPC
 // request with a higher term, that is set here too. Also reset the voting stats.
 func (rf *Raft) setFollowerState(newTerm int) {
@@ -292,7 +302,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Unlock()
 	isLeader := rf.isLeader()
 	if isLeader {
-		log.Printf("Raft %d, as leader, is appending command %v, to log index %d", rf.me, command, logLen+1)
+		log.Printf("Raft %d, as leader, is appending command %v, to log index %d for term %d",
+			rf.me, command, logLen+1, term)
 		index = rf.appendToLog(LogEntry{Term: term, Command: command})
 	}
 	return index, term, isLeader
@@ -328,14 +339,9 @@ func getTimeToSleep() time.Duration {
 func (rf *Raft) campaign() {
 	// Channel for each vote getting goroutine to share to describe the vote result
 	resultChan := make(chan bool)
+	lastLogTerm := rf.getLastLogTerm()
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
-	var lastLogTerm int
-	if len(rf.log) == 0 {
-		lastLogTerm = 0
-	} else {
-		lastLogTerm = rf.log[len(rf.log)-1].Term
-	}
 	logIdx := len(rf.log)
 	rf.mu.Unlock()
 	// This should all be thread-safe, we don't change rf.peers, or rf.me
