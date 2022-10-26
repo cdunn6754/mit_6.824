@@ -447,20 +447,68 @@ func (rf *Raft) setLeaderArraysTo(nextIndex int, matchIndex int) {
 	}
 }
 
+// Determine which entries should be sent, and the previous entry information
+func (rf *Raft) getAppendEntryArgs(peerIdx int) *AppendEntriesArgs {
+	args := &AppendEntriesArgs{}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	nextIdx := rf.nextIndex[peerIdx]
+	lastLogIdx := len(rf.log)
+
+	// Make sure that nextIndex is valid for assumptions made below
+	if nextIdx < 1 || nextIdx > lastLogIdx+1 {
+		log.Panicf("Raft %d has an improperly set nextIndex for peer %d: %+v, with log %+v",
+			rf.me, peerIdx, rf.nextIndex, rf.log)
+	}
+
+	if lastLogIdx == 0 {
+		// There are not log entries yet, just send a heartbeat
+		args.PrevLogIndex = 0
+		args.PrevLogTerm = 0
+		args.Entries = nil
+	} else if lastLogIdx == 1 {
+		// These are set to 0 to prevent the follower from checking if they match a real previous entry,
+		// which doesn't (shouldn't) exist
+		args.PrevLogIndex = 0
+		args.PrevLogTerm = 0
+		if nextIdx == 1 {
+			args.Entries = []LogEntry{rf.log[0]}
+		} else {
+			// The follower already has this single entry
+			args.Entries = nil
+		}
+	} else {
+		args.PrevLogIndex = nextIdx - 1
+		if nextIdx == 1 {
+			// The follower log is empty still, so turn off prevEntry checking on the follower RPC handler
+			args.PrevLogTerm = 0
+		} else {
+			// Here there is a previous entry in the slice
+			args.PrevLogTerm = rf.log[nextIdx-2].Term
+		}
+
+		if lastLogIdx >= nextIdx {
+			// The Raft algorithm is 1 indexed
+			args.Entries = []LogEntry{rf.log[nextIdx-1]}
+		} else {
+			args.Entries = nil
+		}
+	}
+	args.Term = rf.currentTerm
+	args.LeaderCommit = rf.commitIndex
+	args.LeaderId = rf.me
+	return args
+}
+
 // A long running goroutine to send an append entries requests or heartbeats and update the leader state based
 // on the response
 func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.Context) {
-	args := &AppendEntriesArgs{}
 	reply := &AppendEntriesReply{}
 	rf.mu.Lock()
 	nextIndex := rf.nextIndex[peerIdx]
 	matchIndex := rf.matchIndex[peerIdx]
 	currentTerm := rf.currentTerm
 	lastLogIdx := len(rf.log)
-
-	// Figure out which entries should be sent
-	// TODO: Create a type Log []LogEntry, and add a method GetPreviousEntry, to hide all of this
-	// extra careful checking for when nextIndex < 2
 
 	// The algorithm should ensure that nextIndex in [1, lastLogIndex+1], but double check here and
 	// reinitialize the fields if necessary
@@ -474,44 +522,8 @@ func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.
 		log.Printf("Raft %d restarting append entry handler for peer %d with next index %d and match index 0",
 			rf.me, peerIdx, nextIndex)
 	}
-
-	if lastLogIdx == 0 {
-		// There are not log entries yet, just send a heartbeat
-		args.PrevLogIndex = 0
-		args.PrevLogTerm = 0
-		args.Entries = nil
-	} else if lastLogIdx == 1 {
-		// These are set to 0 to prevent the follower from checking if they match a real previous entry,
-		// which doesn't (shouldn't) exist
-		args.PrevLogIndex = 0
-		args.PrevLogTerm = 0
-		if nextIndex == 1 {
-			args.Entries = []LogEntry{rf.log[0]}
-		} else {
-			// The follower already has this single entry
-			args.Entries = nil
-		}
-	} else {
-		args.PrevLogIndex = nextIndex - 1
-		if nextIndex == 1 {
-			// The follower log is empty still, so turn off prevEntry checking on the follower RPC handler
-			args.PrevLogTerm = 0
-		} else {
-			// Here there is a previous entry in the slice
-			args.PrevLogTerm = rf.log[nextIndex-2].Term
-		}
-
-		if lastLogIdx >= nextIndex {
-			// The Raft algorithm is 1 indexed
-			args.Entries = []LogEntry{rf.log[nextIndex-1]}
-		} else {
-			args.Entries = nil
-		}
-	}
-	args.Term = rf.currentTerm
-	args.LeaderCommit = rf.commitIndex
-	args.LeaderId = rf.me
 	rf.mu.Unlock()
+	args := rf.getAppendEntryArgs(peerIdx)
 
 	// Send the request
 	// log.Printf("Raft %d as leader is sending an appendEntry RPC to follower %d: %+v", rf.me, peerIdx, args)
@@ -519,9 +531,8 @@ func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.
 
 	// Don't do anything if this instance isn't the leader anymore
 	// TODO: this isLeader check is a little costly, I think a better solution might be to
-	// pass a channel from the commandFollower fcn that closes when the ctx is canceled, i.e. when leadership
-	// is lost. Then check for that here like select{ case <-lostLeadership: return default: pass}. This seems like
-	// a good way to cache the state locally.
+	// rely on the ctx. Then check for that here like select{ case <-ctx.Done(): return default: pass}.
+	// This seems like a good way to cache the state locally.
 	if !rf.isLeader() {
 		log.Printf("Raft %d is ignoring the appendEntries response for peer %d because it is no longer the leader",
 			rf.me, peerIdx)
@@ -579,21 +590,9 @@ func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.
 // Send an initial heartbeat and then start a goroutine to handle updating this peer's log
 func (rf *Raft) commandFollower(peerIdx int, failureChan chan int, ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
-	rf.mu.Lock()
-	currentTerm := rf.currentTerm
-	rf.mu.Unlock()
-	// For the initial heartbeat, just send prev entries 0, that will heartbeat and avoid
-	// any data checking in the receiver
-	args := &AppendEntriesArgs{
-		Term:         currentTerm,
-		LeaderId:     rf.me,
-		PrevLogIndex: 0,
-		PrevLogTerm:  0,
-		Entries:      nil,
-		LeaderCommit: rf.commitIndex,
-	}
 	reply := &AppendEntriesReply{}
 	// Send an initial heartbeat
+	args := rf.getAppendEntryArgs(peerIdx)
 	go func() { rf.sendAppendEntries(peerIdx, args, reply) }()
 
 	for !rf.killed() {
