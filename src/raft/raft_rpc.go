@@ -21,7 +21,8 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	// log.Printf("Raft %d, term %d received append entries request from %d, term %d", rf.me, rf.currentTerm, args.LeaderId, args.Term)
+	log.Printf("Raft %d, term %d received append entries request from %d, args: %+v",
+		rf.me, rf.currentTerm, args.LeaderId, args)
 	reply.Term = rf.currentTerm
 	rf.mu.Unlock()
 	defer log.Printf("Raft %d returning from appendEntries to leader %d, %v", rf.me, args.LeaderId, reply)
@@ -61,21 +62,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Success = true
-	// Check if the Leader has decided that any of the entries are committed
-	newCommitIdx := int(math.Min(float64(args.LeaderCommit), float64(len(rf.log))))
-	if newCommitIdx > rf.commitIndex {
-		// Any entries that couldn't be committed before, should be now, e.g entries from previous terms
-		// The next time an appendEntry call is made, it will commit the next index until it reaches and commits newCommitIdx
-		// TODO: put this in a loop so that a single appendEntry call results in this follower getting
-		// caught up on the commit indexes
-		rf.stepCommitIdx(newCommitIdx)
-		log.Printf("Raft %d increasing commit index to %d", rf.me, rf.commitIndex)
-		rf.applyMsgChan <- ApplyMsg{
-			CommandValid: true,
-			CommandIndex: rf.commitIndex,
-			Command:      rf.log[rf.commitIndex-1].Command,
-		}
-	}
 
 	if args.Entries != nil || len(args.Entries) > 0 {
 		// For the time being only one log entry at a time is supported, TODO optimization here
@@ -88,6 +74,30 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// rid of unwanted logs and adding the new one simply
 		rf.updateLog(append(rf.log[:args.PrevLogIndex], entry))
 		log.Printf("Raft %d adding entry %v to log at index %d", rf.me, entry.Command, len(rf.log))
+	}
+
+	// Update the commit index for this instance if appropriate
+	newCommitIdx := args.PrevLogIndex
+	if args.Entries != nil && len(args.Entries) > 0 {
+		// If there is a new entry on top of a valid PrevLogEntry, that can potentially be committed too
+		// Multiple entries in args.Entries is supported here, but not below
+		newCommitIdx += len(args.Entries)
+	}
+	// Only commit up to whatever the leader has committed, note that LeaderCommit >= rf.commitIndex
+	newCommitIdx = int(math.Min(float64(args.LeaderCommit), float64(newCommitIdx)))
+	if newCommitIdx > rf.commitIndex {
+		// Any entries that couldn't be committed before, should be now, e.g entries from previous terms
+		// The next time an appendEntry call is made, it will commit the next index until it reaches and commits
+		// newCommitIdx.
+		// TODO: put this in a loop so that a single appendEntry call results in this follower getting
+		// caught up on the commit indexes
+		rf.stepCommitIdx(newCommitIdx)
+		log.Printf("Raft %d increasing commit index to %d", rf.me, rf.commitIndex)
+		rf.applyMsgChan <- ApplyMsg{
+			CommandValid: true,
+			CommandIndex: rf.commitIndex,
+			Command:      rf.log[rf.commitIndex-1].Command,
+		}
 	}
 }
 

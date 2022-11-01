@@ -467,20 +467,22 @@ func (rf *Raft) getAppendEntryArgs(peerIdx int) *AppendEntriesArgs {
 		args.PrevLogTerm = 0
 		args.Entries = nil
 	} else if lastLogIdx == 1 {
-		// These are set to 0 to prevent the follower from checking if they match a real previous entry,
-		// which doesn't (shouldn't) exist
-		args.PrevLogIndex = 0
-		args.PrevLogTerm = 0
 		if nextIdx == 1 {
 			args.Entries = []LogEntry{rf.log[0]}
+			// These are set to 0 to prevent the follower from checking if they match a real previous entry,
+			// which doesn't (shouldn't) exist
+			args.PrevLogIndex = 0
+			args.PrevLogTerm = 0
 		} else {
 			// The follower already has this single entry
 			args.Entries = nil
+			args.PrevLogIndex = 1
+			args.PrevLogTerm = 1
 		}
 	} else {
 		args.PrevLogIndex = nextIdx - 1
 		if nextIdx == 1 {
-			// The follower log is empty still, so turn off prevEntry checking on the follower RPC handler
+			// The follower log is empty still, so there are no previous entries
 			args.PrevLogTerm = 0
 		} else {
 			// Here there is a previous entry in the slice
