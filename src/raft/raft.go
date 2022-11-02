@@ -490,8 +490,8 @@ func (rf *Raft) getAppendEntryArgs(peerIdx int) *AppendEntriesArgs {
 		}
 
 		if lastLogIdx >= nextIdx {
-			// The Raft algorithm is 1 indexed
-			args.Entries = []LogEntry{rf.log[nextIdx-1]}
+			// The Raft algorithm is 1 indexed, send the rest of the entries
+			args.Entries = append(args.Entries, rf.log[nextIdx-1:]...)
 		} else {
 			args.Entries = nil
 		}
@@ -584,7 +584,7 @@ func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.
 		// It was successful, increment the peer arrays
 		if args.Entries != nil {
 			rf.nextIndex[peerIdx] = nextIndex + len(args.Entries)
-			rf.matchIndex[peerIdx] = nextIndex
+			rf.matchIndex[peerIdx] = rf.nextIndex[peerIdx] - 1
 		}
 	}
 }

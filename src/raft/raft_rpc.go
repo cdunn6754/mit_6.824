@@ -64,23 +64,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 
 	if args.Entries != nil || len(args.Entries) > 0 {
-		// For the time being only one log entry at a time is supported, TODO optimization here
-		if len(args.Entries) > 1 {
-			log.Panic("Sending more than one command at a time is not supported")
-		}
-		entry := args.Entries[0]
-
 		// TODO: it might be better to check if this entry already exists here, but this accomplishes getting
 		// rid of unwanted logs and adding the new one simply
-		rf.updateLog(append(rf.log[:args.PrevLogIndex], entry))
-		log.Printf("Raft %d adding entry %v to log at index %d", rf.me, entry.Command, len(rf.log))
+		rf.updateLog(append(rf.log[:args.PrevLogIndex], args.Entries...))
+		commands := make([]interface{}, len(args.Entries))
+		for i, e := range args.Entries {
+			commands[i] = e.Command
+		}
+		log.Printf("Raft %d adding entries %v to log at index %d", rf.me, commands, len(rf.log))
 	}
 
 	// Update the commit index for this instance if appropriate
 	newCommitIdx := args.PrevLogIndex
 	if args.Entries != nil && len(args.Entries) > 0 {
 		// If there is a new entry on top of a valid PrevLogEntry, that can potentially be committed too
-		// Multiple entries in args.Entries is supported here, but not below
 		newCommitIdx += len(args.Entries)
 	}
 	// Only commit up to whatever the leader has committed, note that LeaderCommit >= rf.commitIndex
