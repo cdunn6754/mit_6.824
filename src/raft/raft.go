@@ -133,7 +133,7 @@ func (rf *Raft) appendToLog(entry LogEntry) int {
 // an old term.
 // Not thread safe
 func (rf *Raft) stepCommitIdx(newCommitIdx int) {
-	if rf.commitIndex+1 < newCommitIdx {
+	if rf.commitIndex < newCommitIdx {
 		rf.commitIndex += 1
 	} else {
 		rf.commitIndex = newCommitIdx

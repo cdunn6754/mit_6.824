@@ -71,7 +71,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		for i, e := range args.Entries {
 			commands[i] = e.Command
 		}
-		log.Printf("Raft %d adding entries %v to log at index %d", rf.me, commands, len(rf.log))
+		log.Printf("Raft %d adding %d entries ending up at log at index %d", rf.me, len(commands), len(rf.log))
 	}
 
 	// Update the commit index for this instance if appropriate
@@ -82,7 +82,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// Only commit up to whatever the leader has committed, note that LeaderCommit >= rf.commitIndex
 	newCommitIdx = int(math.Min(float64(args.LeaderCommit), float64(newCommitIdx)))
-	if newCommitIdx > rf.commitIndex {
+	for newCommitIdx > rf.commitIndex {
 		// Any entries that couldn't be committed before, should be now, e.g entries from previous terms
 		// The next time an appendEntry call is made, it will commit the next index until it reaches and commits
 		// newCommitIdx.
