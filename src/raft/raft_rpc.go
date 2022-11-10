@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"log"
 	"math"
 	"sync"
@@ -14,9 +15,29 @@ type AppendEntriesArgs struct {
 	Entries      []LogEntry
 	LeaderCommit int
 }
+
+// To implement the optimization from the end of section 5.3
+type EarlyConflict struct {
+	Term  int
+	Index int
+}
+
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term     int
+	Success  bool
+	Conflict EarlyConflict
+}
+
+// Given a term, find the lowest index in the log that holds that term
+// Returns the 1 indexed Raft algorithm index, not the index in the rf.log slice.
+// Not thread safe
+func (rf *Raft) firstTermIndex(term int) (firstIndex int, err error) {
+	for idx, entry := range rf.log {
+		if entry.Term == term {
+			return idx + 1, nil
+		}
+	}
+	return 0, fmt.Errorf("unable to find specified term %d in log entries", term)
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -27,6 +48,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Unlock()
 	defer log.Printf("Raft %d returning from appendEntries to leader %d, %v", rf.me, args.LeaderId, reply)
 	if args.Term < reply.Term {
+		// This should result in the leader giving up leadership, e.g. it may have become partitioned and fallen behind
 		reply.Success = false
 		return
 	}
@@ -49,10 +71,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		logEntry := rf.log[args.PrevLogIndex-1]
 		if logEntry.Term != args.PrevLogTerm {
 			rf.mu.Lock()
-			rf.updateLog(rf.log[:args.PrevLogIndex])
+			firstIdx, err := rf.firstTermIndex(logEntry.Term)
+			if err != nil {
+				log.Printf("Unable to find first index of term %d: %s", logEntry.Term, err)
+				// Just default to stepping back a single entry
+				firstIdx = args.PrevLogIndex
+			}
+			rf.updateLog(rf.log[:firstIdx])
 			rf.mu.Unlock()
-			log.Printf("Raft %d can't append entry because it has a term mismatch with PrevLogTerm %d",
-				rf.me, args.PrevLogTerm)
+			reply.Conflict = EarlyConflict{Term: logEntry.Term, Index: firstIdx}
+			log.Printf("Raft %d can't append entry because it has a term mismatch with PrevLogTerm %d, early conflict: %v",
+				rf.me, args.PrevLogTerm, reply.Conflict)
 			reply.Success = false
 			return
 		}

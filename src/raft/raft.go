@@ -571,10 +571,16 @@ func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.
 			return
 		} else {
 			// Back off the nextIndex for next time, but don't let nextIndex < 1
-			if nextIndex > 1 {
-				rf.nextIndex[peerIdx] = nextIndex - 1
+			// Default to stepping back one
+			nnIndex := nextIndex - 1
+			if reply.Conflict != (EarlyConflict{}) {
+				// Skip over all follower log entries that share the conflicting term if info is provided
+				nnIndex = reply.Conflict.Index
+			}
+			if nnIndex > 0 {
+				rf.nextIndex[peerIdx] = nnIndex
 				log.Printf("Raft %d AppendEntries to peer %d failed, lowering nextIndex from %d to %d ",
-					rf.me, peerIdx, nextIndex, nextIndex-1)
+					rf.me, peerIdx, nextIndex, nnIndex)
 			} else {
 				log.Printf("Raft %d AppendEntries to peer %d failed, but nextIndex was already at 1",
 					rf.me, peerIdx)
