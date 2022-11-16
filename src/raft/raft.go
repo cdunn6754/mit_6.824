@@ -381,6 +381,7 @@ func (rf *Raft) campaign() {
 			// A RequestVote RPC came in with a higher term. Revert to follower in new term
 			log.Printf("Raft %d while campaigning, received a higher term rpc for term %d", rf.me, newTermData.term)
 			rf.handleStateChange(StateChangeData{newTerm: newTermData.term, newState: Follower}, newTermData.wg)
+			return
 		case <-timeoutChan:
 			log.Printf("Raft %d timed out while campaigning in term %d", rf.me, currentTerm)
 			rf.handleStateChange(StateChangeData{newTerm: currentTerm, newState: Follower}, nil)
