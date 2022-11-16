@@ -645,7 +645,7 @@ func (rf *Raft) commitIndexHandler(ctx context.Context, wg *sync.WaitGroup) {
 		case <-ctx.Done():
 			log.Printf("Raft %d stopping the commitIndexHandler", rf.me)
 			return
-		case <-time.After(time.Millisecond * 100):
+		case <-time.After(time.Millisecond * 10):
 			rf.mu.Lock()
 			n := rf.commitIndex + 1
 			if n > len(rf.log) {
