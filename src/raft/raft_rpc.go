@@ -42,8 +42,8 @@ func (rf *Raft) firstTermIndex(term int) (firstIndex int, err error) {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	log.Printf("Raft %d, term %d received append entries request from %d, args: %+v",
-		rf.me, rf.currentTerm, args.LeaderId, args)
+	log.Printf("Raft %d, term %d received append entries request from %d, for term %d and prev log (term, idx): (%d, %d)",
+		rf.me, rf.currentTerm, args.LeaderId, args.Term, args.PrevLogTerm, args.PrevLogIndex)
 	reply.Term = rf.currentTerm
 	rf.mu.Unlock()
 	defer log.Printf("Raft %d returning from appendEntries to leader %d, %v", rf.me, args.LeaderId, reply)
@@ -65,6 +65,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			log.Printf("Raft %d can't append entry because it lacks the PrevLogIndex entry at index %d",
 				rf.me, args.PrevLogIndex)
 			reply.Success = false
+			if lastIdx := len(rf.log); lastIdx > 0 {
+				// This follower has log entries, but isn't caught up to the leader, skip back to start comparing where
+				// with entries that this follower does have
+				reply.Conflict = EarlyConflict{rf.log[lastIdx-1].Term, lastIdx}
+			} else {
+				// This follower has no log entries, the leader should start sending them from the beginning
+				reply.Conflict = EarlyConflict{0, 1}
+			}
 			return
 		}
 		// Check that the previous log entry term matches, otherwise drop it from this log and fail
@@ -113,10 +121,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	newCommitIdx = int(math.Min(float64(args.LeaderCommit), float64(newCommitIdx)))
 	for newCommitIdx > rf.commitIndex {
 		// Any entries that couldn't be committed before, should be now, e.g entries from previous terms
-		// The next time an appendEntry call is made, it will commit the next index until it reaches and commits
+		// In this loop it will commit the next index until it reaches and commits
 		// newCommitIdx.
-		// TODO: put this in a loop so that a single appendEntry call results in this follower getting
-		// caught up on the commit indexes
 		rf.stepCommitIdx(newCommitIdx)
 		log.Printf("Raft %d increasing commit index to %d", rf.me, rf.commitIndex)
 		rf.applyMsgChan <- ApplyMsg{
