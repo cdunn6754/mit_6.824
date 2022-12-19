@@ -60,6 +60,12 @@ type LogEntry struct {
 	Term    int
 }
 
+type Snapshot struct {
+	State []byte
+	Index int
+	Term  int
+}
+
 type HeartbeatData struct {
 	leaderId int
 	newTerm  int
@@ -68,8 +74,8 @@ type HeartbeatData struct {
 // A WaitGroup is necessary for the calls from the async RPC handlers, e.g.
 // if a  RequestVote request comes with a higher term, then that handler kicks off
 // a state change via the newTerm channel, but it needs to wait for that state change
-// to be completed before it can decide on its vote and formulate a response. This is because its rf.votedFor will
-// be reset by the state change.
+// to be completed before it can decide on its vote and formulate a response. This is because
+// its rf.votedFor will be reset by the state change.
 type NewTermData struct {
 	term int
 	wg   *sync.WaitGroup
@@ -104,6 +110,7 @@ type Raft struct {
 	log         []LogEntry
 	votedFor    int
 	currentTerm int
+	snapshot    Snapshot
 
 	// Volatile for all servers
 	commitIndex int
@@ -235,15 +242,19 @@ func (rf *Raft) persist() {
 	e.Encode(rf.log)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.currentTerm)
-	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	raft_data := w.Bytes()
+	ssw := new(bytes.Buffer)
+	sse := labgob.NewEncoder(ssw)
+	sse.Encode(rf.snapshot)
+	ss_data := ssw.Bytes()
+	rf.persister.SaveStateAndSnapshot(raft_data, ss_data)
 }
 
 //
 // restore previously persisted state.
 //
-func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+func (rf *Raft) readPersist(data []byte, ss_data []byte) {
+	if (data == nil || len(data) < 1) && (ss_data == nil || len(ss_data) < 1) { // bootstrap without any state
 		return
 	}
 
@@ -258,6 +269,16 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.log = _log
 		rf.votedFor = votedFor
 		rf.currentTerm = currentTerm
+	}
+
+	// Snapshot
+	ssr := bytes.NewBuffer(ss_data)
+	ssd := labgob.NewDecoder(ssr)
+	var ss Snapshot
+	if ssd.Decode(&ss) != nil {
+		log.Fatalf("Error reading persisted snapshot data: %v", rf.me)
+	} else {
+		rf.snapshot = ss
 	}
 }
 
@@ -879,7 +900,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	rf.readPersist(persister.ReadRaftState(), persister.ReadSnapshot())
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
