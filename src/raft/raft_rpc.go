@@ -54,7 +54,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// As long as the args.Term is >= rf.currentTerm, this is a valid heartbeat
 	rf.heartbeatChan <- HeartbeatData{leaderId: args.LeaderId, newTerm: args.Term}
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	// At startup the leader won't have a log, and PrevLogIndex == 0
 	// Also when the leader is sending the first entry the PrevLogIndex == 0, in either case
 	// don't expect that previous entry to exist in the follower log
@@ -78,7 +79,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// Check that the previous log entry term matches, otherwise drop it from this log and fail
 		logEntry := rf.log[args.PrevLogIndex-1]
 		if logEntry.Term != args.PrevLogTerm {
-			rf.mu.Lock()
 			firstIdx, err := rf.firstTermIndex(logEntry.Term)
 			if err != nil {
 				log.Printf("Unable to find first index of term %d: %s", logEntry.Term, err)
@@ -86,7 +86,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				firstIdx = args.PrevLogIndex
 			}
 			rf.updateLog(rf.log[:firstIdx])
-			rf.mu.Unlock()
 			reply.Conflict = EarlyConflict{Term: logEntry.Term, Index: firstIdx}
 			log.Printf("Raft %d can't append entry because it has a term mismatch with PrevLogTerm %d, early conflict: %v",
 				rf.me, args.PrevLogTerm, reply.Conflict)
@@ -96,8 +95,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// Looks good, now append the new entries
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	reply.Success = true
 
 	if args.Entries != nil || len(args.Entries) > 0 {
