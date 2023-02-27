@@ -58,6 +58,8 @@ type ApplyMsg struct {
 type LogEntry struct {
 	Command interface{}
 	Term    int
+	// This is the algorithm index, i.e. it is one indexed so rf.log[0].Index == 1
+	Index int
 }
 
 type Snapshot struct {
@@ -193,12 +195,27 @@ func (rf *Raft) updateLog(newLog []LogEntry) {
 }
 
 // Create and append a new entry to the log
-func (rf *Raft) appendToLog(entry LogEntry) int {
+// Returns the index of the appended entry
+func (rf *Raft) appendToLog(term int, command interface{}) int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	var index int
+	if len(rf.log) == 0 {
+		// Maybe we are just starting, maybe the log was just compacted
+		if rf.lastIncludedIndex == -1 {
+			// There hasn't been a snapshot yet, this is the initial startup
+			index = 1
+		} else {
+			// There was a snapshot, build on that
+			index = rf.lastIncludedIndex + 1
+		}
+	} else {
+		index = rf.log[len(rf.log)-1].Index + 1
+	}
+	entry := LogEntry{Index: index, Term: term, Command: command}
 	rf.log = append(rf.log, entry)
 	rf.persist()
-	return len(rf.log)
+	return index
 }
 
 // Given a new valid commitIndex, step the commit index up to the next in order, the entries must be
@@ -288,12 +305,18 @@ func (rf *Raft) readPersist(data []byte, ss_data []byte) {
 	var _log []LogEntry
 	var votedFor int
 	var currentTerm int
-	if d.Decode(&_log) != nil || d.Decode(&votedFor) != nil || d.Decode(&currentTerm) != nil {
+	var lastIncludedIndex int
+	var lastIncludedTerm int
+	if d.Decode(&_log) != nil || d.Decode(&votedFor) != nil || d.Decode(&currentTerm) != nil ||
+		d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil {
 		log.Fatalf("Error reading persisted data on server: %v", rf.me)
 	} else {
 		rf.log = _log
 		rf.votedFor = votedFor
 		rf.currentTerm = currentTerm
+		// These could be a part of the snapshot persistance, but they are a part of the Raft state too
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
 	}
 
 	// Snapshot
@@ -350,7 +373,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		log.Printf("Raft %d, as leader, is appending command %v, to log index %d for term %d",
 			rf.me, command, logLen+1, term)
-		index = rf.appendToLog(LogEntry{Term: term, Command: command})
+		index = rf.appendToLog(term, command)
 	}
 	return index, term, isLeader
 }
@@ -908,6 +931,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyMsgChan = applyCh
 	rf.currentTerm = 0
 	rf.votedFor = -1
+	// Set these as -1 until the first snapshot is taken
+	rf.lastIncludedTerm = -1
+	rf.lastIncludedIndex = -1
 	rf.log = make([]LogEntry, 0)
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
