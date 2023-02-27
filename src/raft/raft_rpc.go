@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"fmt"
 	"log"
 	"math"
 	"sync"
@@ -26,18 +25,6 @@ type AppendEntriesReply struct {
 	Term     int
 	Success  bool
 	Conflict EarlyConflict
-}
-
-// Given a term, find the lowest index in the log that holds that term
-// Returns the 1 indexed Raft algorithm index, not the index in the rf.log slice.
-// Not thread safe
-func (rf *Raft) firstTermIndex(term int) (firstIndex int, err error) {
-	for idx, entry := range rf.log {
-		if entry.Term == term {
-			return idx + 1, nil
-		}
-	}
-	return 0, fmt.Errorf("unable to find specified term %d in log entries", term)
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -76,7 +63,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 			return
 		}
-		// Check that the previous log entry term matches, otherwise drop it from this log and fail
+		// Check that the term of the previous log entry matches, otherwise drop it from this log and fail
 		logEntry := rf.log[args.PrevLogIndex-1]
 		if logEntry.Term != args.PrevLogTerm {
 			firstIdx, err := rf.firstTermIndex(logEntry.Term)

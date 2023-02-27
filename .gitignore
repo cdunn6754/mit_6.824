@@ -8,3 +8,5 @@ api.key
 // Ignore the data files
 map_out_*
 
+
+log.out

@@ -21,8 +21,8 @@ import (
 	//	"bytes"
 	"bytes"
 	"context"
+	"fmt"
 	"log"
-	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -121,31 +121,9 @@ type Raft struct {
 	matchIndex []int
 }
 
-// Update the Raft log to the provided log, persist raft to durable storage
-func (rf *Raft) updateLog(newLog []LogEntry) {
-	rf.log = newLog
-	rf.persist()
-}
-
-func (rf *Raft) appendToLog(entry LogEntry) int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.log = append(rf.log, entry)
-	rf.persist()
-	return len(rf.log)
-}
-
-// Given a new valid commitIndex, step the commit index up to the next in order, the entries must be
-// committed in order. I.e., don't skip any entries that were uncommitted previously because of
-// an old term.
-// Not thread safe
-func (rf *Raft) stepCommitIdx(newCommitIdx int) {
-	if rf.commitIndex < newCommitIdx {
-		rf.commitIndex += 1
-	} else {
-		rf.commitIndex = newCommitIdx
-	}
-}
+//
+// Property getters (read-only)
+//
 
 // If the nextIndex or matchIndex arrays contain values other than -1
 // this instance is a leader
@@ -170,20 +148,6 @@ func (rf *Raft) isFollower() bool {
 	return !rf.isLeader() && !rf.isCandidate()
 }
 
-// An internal version of getState that specifies the state of the instance, either leader, candidate, or follower
-func (rf *Raft) getState() RaftState {
-	if rf.isLeader() {
-		return Leader
-	} else if rf.isFollower() {
-		return Follower
-	} else if rf.isCandidate() {
-		return Candidate
-	} else {
-		log.Panicf("Raft %d in indeterminate state: %+v", rf.me, rf)
-		return 0
-	}
-}
-
 // Get the term of the latest log entry, if there is none, return 0
 func (rf *Raft) getLastLogTerm() int {
 	rf.mu.Lock()
@@ -193,6 +157,73 @@ func (rf *Raft) getLastLogTerm() int {
 	}
 	return rf.log[len(rf.log)-1].Term
 }
+
+// Given a term, find the lowest index in the log that holds that term
+// Returns the 1 indexed Raft algorithm index, not the index in the rf.log slice.
+// Not thread safe
+func (rf *Raft) firstTermIndex(term int) (firstIndex int, err error) {
+	for idx, entry := range rf.log {
+		if entry.Term == term {
+			return idx + 1, nil
+		}
+	}
+	return 0, fmt.Errorf("unable to find specified term %d in log entries", term)
+}
+
+// return currentTerm and whether this server
+// believes it is the leader.
+func (rf *Raft) GetState() (int, bool) {
+	rf.mu.Lock()
+	currentTerm := rf.currentTerm
+	rf.mu.Unlock()
+	log.Printf("Raft %d state: term %d, leader %t", rf.me, currentTerm, rf.isLeader())
+	return currentTerm, rf.isLeader()
+}
+
+//
+// Property setters
+//
+
+// Update the Raft log to the provided log, persist raft to durable storage
+func (rf *Raft) updateLog(newLog []LogEntry) {
+	rf.log = newLog
+	rf.persist()
+}
+
+// Create and append a new entry to the log
+func (rf *Raft) appendToLog(entry LogEntry) int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.log = append(rf.log, entry)
+	rf.persist()
+	return len(rf.log)
+}
+
+// Given a new valid commitIndex, step the commit index up to the next in order, the entries must be
+// committed in order. I.e., don't skip any entries that were uncommitted previously because of
+// an old term.
+// Not thread safe
+func (rf *Raft) stepCommitIdx(newCommitIdx int) {
+	if rf.commitIndex < newCommitIdx {
+		rf.commitIndex += 1
+	} else {
+		rf.commitIndex = newCommitIdx
+	}
+}
+
+// An internal version of getState that specifies the state of the instance, either leader, candidate, or follower
+// func (rf *Raft) getState() RaftState {
+// 	if rf.isLeader() {
+// 		return Leader
+// 	} else if rf.isFollower() {
+// 		return Follower
+// 	} else if rf.isCandidate() {
+// 		return Candidate
+// 	} else {
+// 		log.Panicf("Raft %d in indeterminate state: %+v", rf.me, rf)
+// 		return 0
+// 	}
+// }
 
 // Set this instance's state as a follower, often this is used as the result of a receiving an RPC
 // request with a higher term, that is set here too. Also reset the voting stats.
@@ -219,16 +250,6 @@ func (rf *Raft) setCandidateState(newTerm int) {
 	rf.votedFor = rf.me
 	rf.persist()
 	log.Printf("Raft %d set to candidate for term %d", rf.me, newTerm)
-}
-
-// return currentTerm and whether this server
-// believes it is the leader.
-func (rf *Raft) GetState() (int, bool) {
-	rf.mu.Lock()
-	currentTerm := rf.currentTerm
-	rf.mu.Unlock()
-	log.Printf("Raft %d state: term %d, leader %t", rf.me, currentTerm, rf.isLeader())
-	return currentTerm, rf.isLeader()
 }
 
 //
@@ -350,11 +371,6 @@ func (rf *Raft) Kill() {
 func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
-}
-
-// Generate a timeout duration randomly spaced between [0.5, 1) seconds
-func getTimeToSleep() time.Duration {
-	return time.Millisecond*500 + time.Duration(rand.Intn(500))*time.Millisecond
 }
 
 func (rf *Raft) campaign() {
