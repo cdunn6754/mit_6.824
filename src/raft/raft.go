@@ -107,10 +107,12 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// Persisted
-	log         []LogEntry
-	votedFor    int
-	currentTerm int
-	snapshot    Snapshot
+	log               []LogEntry
+	votedFor          int
+	currentTerm       int
+	snapshot          Snapshot
+	lastIncludedIndex int
+	lastIncludedTerm  int
 
 	// Volatile for all servers
 	commitIndex int
@@ -263,6 +265,8 @@ func (rf *Raft) persist() {
 	e.Encode(rf.log)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.currentTerm)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
 	raft_data := w.Bytes()
 	ssw := new(bytes.Buffer)
 	sse := labgob.NewEncoder(ssw)
