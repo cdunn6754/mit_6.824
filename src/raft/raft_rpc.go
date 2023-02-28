@@ -49,14 +49,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// The Raft logic uses 1-indexing for the log
 	if args.PrevLogIndex > 0 {
 		// Otherwise make sure that this log contains an entry at PrevLogIndex
-		if args.PrevLogIndex > len(rf.log) {
+		prevEntry := rf.getLogEntry(args.PrevLogIndex)
+		if prevEntry == (LogEntry{}) {
+			// Couldn't find the prevLogIndex entry, fail the RPC
 			log.Printf("Raft %d can't append entry because it lacks the PrevLogIndex entry at index %d",
 				rf.me, args.PrevLogIndex)
 			reply.Success = false
-			if lastIdx := len(rf.log); lastIdx > 0 {
+			lastEntry := rf.getLastLogEntry()
+			if lastEntry.Index > 0 {
 				// This follower has log entries, but isn't caught up to the leader, skip back to start comparing where
 				// with entries that this follower does have
-				reply.Conflict = EarlyConflict{rf.log[lastIdx-1].Term, lastIdx}
+				reply.Conflict = EarlyConflict{lastEntry.Term, lastEntry.Index}
 			} else {
 				// This follower has no log entries, the leader should start sending them from the beginning
 				reply.Conflict = EarlyConflict{0, 1}
@@ -64,16 +67,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			return
 		}
 		// Check that the term of the previous log entry matches, otherwise drop it from this log and fail
-		logEntry := rf.log[args.PrevLogIndex-1]
-		if logEntry.Term != args.PrevLogTerm {
-			firstIdx, err := rf.firstTermIndex(logEntry.Term)
+		if prevEntry.Term != args.PrevLogTerm {
+			firstIdx, err := rf.firstTermIndex(prevEntry.Term)
 			if err != nil {
-				log.Printf("Unable to find first index of term %d: %s", logEntry.Term, err)
+				// TODO check here if there is a lastUpdatedSnapshotTerm value, if so send back that term,idx pair
+				// to trigger a snapshot share from the leader
+
+				log.Printf("Unable to find first index of term %d: %s", prevEntry.Term, err)
 				// Just default to stepping back a single entry
 				firstIdx = args.PrevLogIndex
 			}
 			rf.updateLog(rf.log[:firstIdx])
-			reply.Conflict = EarlyConflict{Term: logEntry.Term, Index: firstIdx}
+			reply.Conflict = EarlyConflict{Term: prevEntry.Term, Index: firstIdx}
 			log.Printf("Raft %d can't append entry because it has a term mismatch with PrevLogTerm %d, early conflict: %v",
 				rf.me, args.PrevLogTerm, reply.Conflict)
 			reply.Success = false
@@ -158,9 +163,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	wg.Wait()
 
-	lastLogTerm := rf.getLastLogTerm()
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	lastLogTerm := rf.getLastLogTerm()
 	reply.Term = rf.currentTerm
 
 	// Check on the RAFT algorithm logic here

@@ -126,7 +126,7 @@ type Raft struct {
 }
 
 //
-// Property getters (read-only)
+// Property getters (read-only), thread-safe, should not be called with locks
 //
 
 // If the nextIndex or matchIndex arrays contain values other than -1
@@ -152,23 +152,54 @@ func (rf *Raft) isFollower() bool {
 	return !rf.isLeader() && !rf.isCandidate()
 }
 
+//
+// Property getters (read-only), not thread-safe, should not be called under lock
+//
+
 // Get the term of the latest log entry, if there is none, return 0
+// Not thread safe
 func (rf *Raft) getLastLogTerm() int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	if len(rf.log) == 0 {
 		return 0
 	}
 	return rf.log[len(rf.log)-1].Term
 }
 
+// Get the most recent log entry from the log entry array
+// Note that this will return a zero valued LogEntry struct if the raft log is empty,
+// A valid log entry will always have a term and index >= 1.
+// This also does not consider the possibility of a recent snapshot, if the
+// log is empty following a snapshot, this function will still return LogEntry{}
+// Not thread safe
+func (rf *Raft) getLastLogEntry() LogEntry {
+	if len(rf.log) == 0 {
+		return LogEntry{}
+	}
+	return rf.log[len(rf.log)-1]
+}
+
+// Given an index try to find the corresponding log entry.
+// Return an empty LogEntry{} if not found. That can be distinguished from
+// a valid entry because a valid entry will always have a term and index >= 1.
+// The provided index should the the 1-indexed Raft algorithm index, not the
+// 0-indexed position of the entry within the log
+// Not thread safe
+func (rf *Raft) getLogEntry(index int) LogEntry {
+	for _, entry := range rf.log {
+		if entry.Index == index {
+			return entry
+		}
+	}
+	return LogEntry{}
+}
+
 // Given a term, find the lowest index in the log that holds that term
-// Returns the 1 indexed Raft algorithm index, not the index in the rf.log slice.
+// Returns the 1-indexed Raft algorithm index, not the index in the rf.log slice.
 // Not thread safe
 func (rf *Raft) firstTermIndex(term int) (firstIndex int, err error) {
-	for idx, entry := range rf.log {
+	for _, entry := range rf.log {
 		if entry.Term == term {
-			return idx + 1, nil
+			return entry.Index, nil
 		}
 	}
 	return 0, fmt.Errorf("unable to find specified term %d in log entries", term)
@@ -403,8 +434,8 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) campaign() {
 	// Channel for each vote getting goroutine to share to describe the vote result
 	resultChan := make(chan bool)
-	lastLogTerm := rf.getLastLogTerm()
 	rf.mu.Lock()
+	lastLogTerm := rf.getLastLogTerm()
 	currentTerm := rf.currentTerm
 	logIdx := len(rf.log)
 	rf.mu.Unlock()
