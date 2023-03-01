@@ -153,7 +153,7 @@ func (rf *Raft) isFollower() bool {
 }
 
 //
-// Property getters (read-only), not thread-safe, should not be called under lock
+// Property getters (read-only), not thread-safe, should be called under lock
 //
 
 // Get the term of the latest log entry, if there is none, return 0
@@ -193,18 +193,6 @@ func (rf *Raft) getLogEntry(index int) LogEntry {
 	return LogEntry{}
 }
 
-// Given a term, find the lowest index in the log that holds that term
-// Returns the 1-indexed Raft algorithm index, not the index in the rf.log slice.
-// Not thread safe
-func (rf *Raft) firstTermIndex(term int) (firstIndex int, err error) {
-	for _, entry := range rf.log {
-		if entry.Term == term {
-			return entry.Index, nil
-		}
-	}
-	return 0, fmt.Errorf("unable to find specified term %d in log entries", term)
-}
-
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -216,14 +204,45 @@ func (rf *Raft) GetState() (int, bool) {
 }
 
 //
-// Property setters
+// Property setters not thread-safe, should be called under lock
 //
 
 // Update the Raft log to the provided log, persist raft to durable storage
+// Not thread safe
 func (rf *Raft) updateLog(newLog []LogEntry) {
 	rf.log = newLog
 	rf.persist()
 }
+
+// Truncate the log at a provided term, the entries of term are removed too.
+// If and entry with this term is not found, and error is returned
+// Not thread safe
+func (rf *Raft) truncateLogTerm(term int) (int, error) {
+	for idx, entry := range rf.log {
+		if entry.Term == term {
+			// Don't worry about garbage collection here, it will happen during log compaction
+			rf.log = rf.log[:idx]
+			return entry.Index, nil
+		}
+	}
+	return 0, fmt.Errorf("unable truncate term %d because no entries of that term could be found", term)
+}
+
+// Given a new valid commitIndex, step the commit index up to the next in order, the entries must be
+// committed in order. I.e., don't skip any entries that were uncommitted previously because of
+// an old term.
+// Not thread safe
+func (rf *Raft) stepCommitIdx(newCommitIdx int) {
+	if rf.commitIndex < newCommitIdx {
+		rf.commitIndex += 1
+	} else {
+		rf.commitIndex = newCommitIdx
+	}
+}
+
+//
+// Property setters thread-safe, should not be called under lock
+//
 
 // Create and append a new entry to the log
 // Returns the index of the appended entry
@@ -247,18 +266,6 @@ func (rf *Raft) appendToLog(term int, command interface{}) int {
 	rf.log = append(rf.log, entry)
 	rf.persist()
 	return index
-}
-
-// Given a new valid commitIndex, step the commit index up to the next in order, the entries must be
-// committed in order. I.e., don't skip any entries that were uncommitted previously because of
-// an old term.
-// Not thread safe
-func (rf *Raft) stepCommitIdx(newCommitIdx int) {
-	if rf.commitIndex < newCommitIdx {
-		rf.commitIndex += 1
-	} else {
-		rf.commitIndex = newCommitIdx
-	}
 }
 
 // An internal version of getState that specifies the state of the instance, either leader, candidate, or follower

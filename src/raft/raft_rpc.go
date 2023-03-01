@@ -66,19 +66,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 			return
 		}
-		// Check that the term of the previous log entry matches, otherwise drop it from this log and fail
+		// Check that the term of the previous log entry matches, otherwise drop the whole term from this log and fail
 		if prevEntry.Term != args.PrevLogTerm {
-			firstIdx, err := rf.firstTermIndex(prevEntry.Term)
-			if err != nil {
-				// TODO check here if there is a lastUpdatedSnapshotTerm value, if so send back that term,idx pair
-				// to trigger a snapshot share from the leader
-
-				log.Printf("Unable to find first index of term %d: %s", prevEntry.Term, err)
-				// Just default to stepping back a single entry
-				firstIdx = args.PrevLogIndex
-			}
-			rf.updateLog(rf.log[:firstIdx])
-			reply.Conflict = EarlyConflict{Term: prevEntry.Term, Index: firstIdx}
+			// No need to check err here, we know that at least prevEntry is there
+			truncatedIdx, _ := rf.truncateLogTerm(prevEntry.Term)
+			reply.Conflict = EarlyConflict{Term: prevEntry.Term, Index: truncatedIdx}
 			log.Printf("Raft %d can't append entry because it has a term mismatch with PrevLogTerm %d, early conflict: %v",
 				rf.me, args.PrevLogTerm, reply.Conflict)
 			reply.Success = false
