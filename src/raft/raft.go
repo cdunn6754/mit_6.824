@@ -207,36 +207,40 @@ func (rf *Raft) GetState() (int, bool) {
 // Property setters not thread-safe, should be called under lock
 //
 
-// Update the Raft log to the provided log, persist raft to durable storage
+// Truncate the log at a provided term, all entries of the term are removed.
+// If an entry with this term is not found, an error is returned.
 // Not thread safe
-func (rf *Raft) updateLog(newLog []LogEntry) {
-	rf.log = newLog
-	rf.persist()
-}
-
-// Truncate the log at a provided term, the entries of term are removed too.
-// If and entry with this term is not found, and error is returned
-// Not thread safe
-func (rf *Raft) truncateLogTerm(term int) (int, error) {
+func (rf *Raft) truncateLogTerm(term int) error {
 	for idx, entry := range rf.log {
 		if entry.Term == term {
 			// Don't worry about garbage collection here, it will happen during log compaction
 			rf.log = rf.log[:idx]
-			return entry.Index, nil
+			return nil
 		}
 	}
-	return 0, fmt.Errorf("unable truncate term %d because no entries of that term could be found", term)
+	return fmt.Errorf("unable truncate term %d because no entries of that term could be found", term)
+}
+
+// Append the provided log entries to the log starting from
+// the entry with the provided index.
+// Not thread safe
+func (rf *Raft) appendAtLogIndex(index int, entries []LogEntry) error {
+	for idx, entry := range rf.log {
+		if entry.Index == index {
+			rf.log = append(rf.log[:idx+1], entries...)
+			return nil
+		}
+	}
+	return fmt.Errorf("unable to append at index %d because an entry with that index couldn't be found", index)
 }
 
 // Given a new valid commitIndex, step the commit index up to the next in order, the entries must be
 // committed in order. I.e., don't skip any entries that were uncommitted previously because of
-// an old term.
+// an old term. The commitIndex can never be lowered.
 // Not thread safe
 func (rf *Raft) stepCommitIdx(newCommitIdx int) {
 	if rf.commitIndex < newCommitIdx {
 		rf.commitIndex += 1
-	} else {
-		rf.commitIndex = newCommitIdx
 	}
 }
 
@@ -260,7 +264,7 @@ func (rf *Raft) appendToLog(term int, command interface{}) int {
 			index = rf.lastIncludedIndex + 1
 		}
 	} else {
-		index = rf.log[len(rf.log)-1].Index + 1
+		index = rf.getLastLogEntry().Index + 1
 	}
 	entry := LogEntry{Index: index, Term: term, Command: command}
 	rf.log = append(rf.log, entry)

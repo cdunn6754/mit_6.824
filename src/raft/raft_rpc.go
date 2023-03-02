@@ -69,8 +69,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// Check that the term of the previous log entry matches, otherwise drop the whole term from this log and fail
 		if prevEntry.Term != args.PrevLogTerm {
 			// No need to check err here, we know that at least prevEntry is there
-			truncatedIdx, _ := rf.truncateLogTerm(prevEntry.Term)
-			reply.Conflict = EarlyConflict{Term: prevEntry.Term, Index: truncatedIdx}
+			rf.truncateLogTerm(prevEntry.Term)
+			// lastEntry may be zero value if log is empty, that's fine and handled by the EarlyConflict logic in the sender
+			lastEntry := rf.getLastLogEntry()
+			reply.Conflict = EarlyConflict{Term: lastEntry.Term, Index: lastEntry.Index}
 			log.Printf("Raft %d can't append entry because it has a term mismatch with PrevLogTerm %d, early conflict: %v",
 				rf.me, args.PrevLogTerm, reply.Conflict)
 			reply.Success = false
@@ -80,24 +82,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Looks good, now append the new entries
 	reply.Success = true
-
-	if args.Entries != nil || len(args.Entries) > 0 {
-		// TODO: it might be better to check if this entry already exists here, but this accomplishes getting
-		// rid of unwanted logs and adding the new one simply
-		rf.updateLog(append(rf.log[:args.PrevLogIndex], args.Entries...))
-		commands := make([]interface{}, len(args.Entries))
-		for i, e := range args.Entries {
-			commands[i] = e.Command
-		}
-		log.Printf("Raft %d adding %d entries ending up at log at index %d", rf.me, len(commands), len(rf.log))
-	}
-
 	// Update the commit index for this instance if appropriate
 	newCommitIdx := args.PrevLogIndex
-	if args.Entries != nil && len(args.Entries) > 0 {
+
+	if len(args.Entries) > 0 {
+		if args.PrevLogIndex == 0 {
+			// Appending the first entries at startup, but this instance may already have a log, so start fresh
+			rf.log = append([]LogEntry{}, args.Entries...)
+		} else {
+			// we know that prevEntry exists from above, so don't worry about the error
+			// TODO: probably this function can be cleaned up so we don't have to have the separated from the
+			// prevEntry checking block above
+			rf.appendAtLogIndex(args.PrevLogIndex, args.Entries)
+		}
+		rf.persist()
+		lastEntry := rf.getLastLogEntry()
+		log.Printf("Raft %d adding %d entries ending up at log at index %d", rf.me, len(args.Entries), lastEntry.Index)
 		// If there is a new entry on top of a valid PrevLogEntry, that can potentially be committed too
-		newCommitIdx += len(args.Entries)
+		newCommitIdx = lastEntry.Index
 	}
+
 	// Only commit up to whatever the leader has committed, note that LeaderCommit >= rf.commitIndex
 	newCommitIdx = int(math.Min(float64(args.LeaderCommit), float64(newCommitIdx)))
 	for newCommitIdx > rf.commitIndex {
@@ -109,7 +113,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.applyMsgChan <- ApplyMsg{
 			CommandValid: true,
 			CommandIndex: rf.commitIndex,
-			Command:      rf.log[rf.commitIndex-1].Command,
+			Command:      rf.getLogEntry(rf.commitIndex).Command,
 		}
 	}
 }
