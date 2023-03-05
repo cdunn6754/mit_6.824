@@ -32,6 +32,8 @@ import (
 	"6.824/labrpc"
 )
 
+var APPEND_INTERVAl = time.Millisecond * 150
+
 //
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -609,9 +611,9 @@ func (rf *Raft) getAppendEntryArgs(peerIdx int) *AppendEntriesArgs {
 	return args
 }
 
-// A long running goroutine to send an append entries requests or heartbeats and update the leader state based
-// on the response
-func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.Context) {
+// Send an append entries request or heartbeat and update the leader state based on the response
+func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
 	reply := &AppendEntriesReply{}
 	rf.mu.Lock()
 	nextIndex := rf.nextIndex[peerIdx]
@@ -634,22 +636,31 @@ func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.
 	rf.mu.Unlock()
 	args := rf.getAppendEntryArgs(peerIdx)
 
-	// Send the request
+	// Send the request, but drop it without waiting for a request timeout if we lose leadership
 	// log.Printf("Raft %d as leader is sending an appendEntry RPC to follower %d: %+v", rf.me, peerIdx, args)
-	ok := rf.sendAppendEntries(peerIdx, args, reply)
-
-	// Don't do anything if this instance isn't the leader anymore
-	// TODO: this isLeader check is a little costly, I think a better solution might be to
-	// rely on the ctx. Then check for that here like select{ case <-ctx.Done(): return default: pass}.
-	// This seems like a good way to cache the state locally.
-	if !rf.isLeader() {
-		log.Printf("Raft %d is ignoring the appendEntries response for peer %d because it is no longer the leader",
+	var ok bool
+	select {
+	case ok = <-rf.sendAppendEntriesAsync(peerIdx, args, reply):
+	case <-ctx.Done():
+		log.Printf(
+			"Raft %d is stopping the appendEntries request early for peer %d because it is no longer the leader",
 			rf.me, peerIdx)
 		return
 	}
+
 	// Handle the responses
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	// Check that this instance didn't lose leadership between the time the response came back and when we got the lock
+	// TODO: it seems like there should be a way to combine this with the ctx.Done in the request select above
+	select {
+	case <-ctx.Done():
+		log.Printf("Raft %d is ignoring the appendEntries response for peer %d because it is no longer the leader",
+			rf.me, peerIdx)
+		return
+	default:
+	}
 
 	// These values may have changed while the request was out, from a concurrent appendToFollower goroutine
 	// for this same peerIdx
@@ -702,21 +713,22 @@ func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.
 	}
 }
 
-// Send an initial heartbeat and then start a goroutine to handle updating this peer's log
+// Send an initial heartbeat and then periodically start a goroutine to handle updating this peer's log
 func (rf *Raft) commandFollower(peerIdx int, failureChan chan int, ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
-	reply := &AppendEntriesReply{}
 	// Send an initial heartbeat
+	reply := &AppendEntriesReply{}
 	args := rf.getAppendEntryArgs(peerIdx)
-	go func() { rf.sendAppendEntries(peerIdx, args, reply) }()
+	rf.sendAppendEntriesAsync(peerIdx, args, reply)
 
 	for !rf.killed() {
 		select {
 		case <-ctx.Done():
 			log.Printf("Raft %d canceling appendEntry request handler for peer %d", rf.me, peerIdx)
 			return
-		case <-time.After(time.Millisecond * 150):
-			go rf.appendToFollower(peerIdx, failureChan, ctx)
+		case <-time.After(APPEND_INTERVAl):
+			wg.Add(1)
+			go rf.appendToFollower(peerIdx, failureChan, ctx, wg)
 		}
 	}
 }

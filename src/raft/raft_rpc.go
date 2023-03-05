@@ -118,6 +118,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 }
 
+// Call sendAppendEntries in a separate go routine. The go routine will write the return value of
+// sendAppendEntries to the channel when the RPC response is received
+func (rf *Raft) sendAppendEntriesAsync(peerIdx int, args *AppendEntriesArgs, reply *AppendEntriesReply) <-chan bool {
+	ch := make(chan bool)
+	go func() {
+		ok := rf.sendAppendEntries(peerIdx, args, reply)
+		ch <- ok
+	}()
+	return ch
+}
+
 func (rf *Raft) sendAppendEntries(peerIdx int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[peerIdx].Call("Raft.AppendEntries", args, reply)
 	return ok
