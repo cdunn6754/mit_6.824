@@ -158,20 +158,11 @@ func (rf *Raft) isFollower() bool {
 // Property getters (read-only), not thread-safe, should be called under lock
 //
 
-// Get the term of the latest log entry, if there is none, return 0
-// Not thread safe
-func (rf *Raft) getLastLogTerm() int {
-	if len(rf.log) == 0 {
-		return 0
-	}
-	return rf.log[len(rf.log)-1].Term
-}
-
 // Get the most recent log entry from the log entry array
 // Note that this will return a zero valued LogEntry struct if the raft log is empty,
 // A valid log entry will always have a term and index >= 1.
 // This also does not consider the possibility of a recent snapshot, if the
-// log is empty following a snapshot, this function will still return LogEntry{}
+// log is empty following a snapshot, this function will still return LogEntry{}.
 // Not thread safe
 func (rf *Raft) getLastLogEntry() LogEntry {
 	if len(rf.log) == 0 {
@@ -193,6 +184,23 @@ func (rf *Raft) getLogEntry(index int) LogEntry {
 		}
 	}
 	return LogEntry{}
+}
+
+// Given an entry index, find the corresponding entry in the log
+// and return a slice starting with it and including every
+// entry after until the end of the log.
+// If an entry with the provided index can't be found, a zero valued
+// []LogEntry is returned.
+// Not thread safe
+func (rf *Raft) getLogFromIndex(index int) []LogEntry {
+	ret := []LogEntry{}
+	for idx, entry := range rf.log {
+		if entry.Index == index {
+			ret = append(ret, rf.log[idx:]...)
+			return ret
+		}
+	}
+	return ret
 }
 
 // return currentTerm and whether this server
@@ -252,7 +260,7 @@ func (rf *Raft) stepCommitIdx(newCommitIdx int) {
 
 // Create and append a new entry to the log
 // Returns the index of the appended entry
-func (rf *Raft) appendToLog(term int, command interface{}) int {
+func (rf *Raft) createAndAppendToLog(term int, command interface{}) int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	var index int
@@ -273,20 +281,6 @@ func (rf *Raft) appendToLog(term int, command interface{}) int {
 	rf.persist()
 	return index
 }
-
-// An internal version of getState that specifies the state of the instance, either leader, candidate, or follower
-// func (rf *Raft) getState() RaftState {
-// 	if rf.isLeader() {
-// 		return Leader
-// 	} else if rf.isFollower() {
-// 		return Follower
-// 	} else if rf.isCandidate() {
-// 		return Candidate
-// 	} else {
-// 		log.Panicf("Raft %d in indeterminate state: %+v", rf.me, rf)
-// 		return 0
-// 	}
-// }
 
 // Set this instance's state as a follower, often this is used as the result of a receiving an RPC
 // request with a higher term, that is set here too. Also reset the voting stats.
@@ -417,7 +411,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		log.Printf("Raft %d, as leader, is appending command %v, to log index %d for term %d",
 			rf.me, command, logLen+1, term)
-		index = rf.appendToLog(term, command)
+		index = rf.createAndAppendToLog(term, command)
 	}
 	return index, term, isLeader
 }
@@ -448,9 +442,8 @@ func (rf *Raft) campaign() {
 	// Channel for each vote getting goroutine to share to describe the vote result
 	resultChan := make(chan bool)
 	rf.mu.Lock()
-	lastLogTerm := rf.getLastLogTerm()
 	currentTerm := rf.currentTerm
-	logIdx := len(rf.log)
+	lastLogEntry := rf.getLastLogEntry()
 	rf.mu.Unlock()
 	// This should all be thread-safe, we don't change rf.peers, or rf.me
 	// Initiate requests to all peers
@@ -460,8 +453,8 @@ func (rf *Raft) campaign() {
 				args := &RequestVoteArgs{
 					Term:         currentTerm,
 					CandidateId:  rf.me,
-					LastLogIndex: logIdx,
-					LastLogTerm:  lastLogTerm,
+					LastLogIndex: lastLogEntry.Index,
+					LastLogTerm:  lastLogEntry.Term,
 				}
 				reply := &RequestVoteReply{}
 				success := rf.sendRequestVote(peerIdx, args, reply)
@@ -562,7 +555,7 @@ func (rf *Raft) getAppendEntryArgs(peerIdx int) *AppendEntriesArgs {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	nextIdx := rf.nextIndex[peerIdx]
-	lastLogIdx := len(rf.log)
+	lastLogIdx := rf.getLastLogEntry().Index
 
 	// Make sure that nextIndex is valid for assumptions made below
 	if nextIdx < 1 || nextIdx > lastLogIdx+1 {
@@ -577,7 +570,7 @@ func (rf *Raft) getAppendEntryArgs(peerIdx int) *AppendEntriesArgs {
 		args.Entries = nil
 	} else if lastLogIdx == 1 {
 		if nextIdx == 1 {
-			args.Entries = []LogEntry{rf.log[0]}
+			args.Entries = []LogEntry{rf.getLogEntry(lastLogIdx)}
 			// These are set to 0 to prevent the follower from checking if they match a real previous entry,
 			// which doesn't (shouldn't) exist
 			args.PrevLogIndex = 0
@@ -594,13 +587,24 @@ func (rf *Raft) getAppendEntryArgs(peerIdx int) *AppendEntriesArgs {
 			// The follower log is empty still, so there are no previous entries
 			args.PrevLogTerm = 0
 		} else {
-			// Here there is a previous entry in the slice
-			args.PrevLogTerm = rf.log[nextIdx-2].Term
+			// Here there is necessarily a previous entry in the slice
+			prevEntry := rf.getLogEntry(nextIdx - 1)
+			if prevEntry == (LogEntry{}) {
+				// Couldn't find the expected entry before the nextIdx, check to see if it's the last one
+				// from log compaction
+				if rf.lastIncludedIndex == nextIdx {
+					args.PrevLogTerm = rf.lastIncludedTerm
+				} else {
+					// TODO: Send a snapshot to the follower, it is too far behind for this
+				}
+			} else {
+				args.PrevLogTerm = prevEntry.Term
+			}
 		}
 
 		if lastLogIdx >= nextIdx {
-			// The Raft algorithm is 1 indexed, send the rest of the entries
-			args.Entries = append(args.Entries, rf.log[nextIdx-1:]...)
+			// Send the rest of the entries
+			args.Entries = append(args.Entries, rf.getLogFromIndex(nextIdx)...)
 		} else {
 			args.Entries = nil
 		}
@@ -619,7 +623,7 @@ func (rf *Raft) appendToFollower(peerIdx int, failureChan chan int, ctx context.
 	nextIndex := rf.nextIndex[peerIdx]
 	matchIndex := rf.matchIndex[peerIdx]
 	currentTerm := rf.currentTerm
-	lastLogIdx := len(rf.log)
+	lastLogIdx := rf.getLastLogEntry().Index
 
 	// The algorithm should ensure that nextIndex in [1, lastLogIndex+1], but double check here and
 	// reinitialize the fields if necessary
@@ -766,7 +770,8 @@ func (rf *Raft) commitIndexHandler(ctx context.Context, wg *sync.WaitGroup) {
 		case <-time.After(time.Millisecond * 10):
 			rf.mu.Lock()
 			n := rf.commitIndex + 1
-			if n > len(rf.log) {
+			lastEntry := rf.getLastLogEntry()
+			if n > lastEntry.Index {
 				// We are up to date, there is no new entries to commit
 				rf.mu.Unlock()
 				break

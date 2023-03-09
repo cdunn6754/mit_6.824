@@ -172,7 +172,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	lastLogTerm := rf.getLastLogTerm()
+	lastLogEntry := rf.getLastLogEntry()
+	lastLogTerm := lastLogEntry.Term
 	reply.Term = rf.currentTerm
 
 	// Check on the RAFT algorithm logic here
@@ -180,7 +181,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	validLog := false
 	if args.LastLogTerm > lastLogTerm {
 		validLog = true
-	} else if args.LastLogTerm == lastLogTerm && args.LastLogIndex >= len(rf.log) {
+	} else if args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogEntry.Index {
 		validLog = true
 	}
 	noVote := rf.votedFor == -1 || rf.votedFor == args.CandidateId
